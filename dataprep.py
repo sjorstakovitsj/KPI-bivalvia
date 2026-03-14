@@ -1,6 +1,7 @@
 # dataprep.py
 from __future__ import annotations
 
+import argparse
 import re
 from pathlib import Path
 
@@ -10,22 +11,42 @@ import pandas as pd
 # ------------------------------------------------------------
 # Config
 # ------------------------------------------------------------
-XLSX = Path("velddata_mosselkartering_midden-nederland.xlsx")
+# Verplichte jaargangen (standaard allemaal verwerken)
+REQUIRED_XLSX = [
+    Path("velddata_mosselkartering_midden-nederland_2024.xlsx"),
+    Path("velddata_mosselkartering_midden-nederland_2023.xlsx"),
+    Path("velddata_mosselkartering_midden-nederland_2021.xlsx"),
+]
+# Optioneel: alle jaren via pattern
+XLSX_GLOB = "velddata_mosselkartering_midden-nederland_*.xlsx"
 OUTDIR = Path("processed")
 OUTDIR.mkdir(exist_ok=True)
 
+# Deelgebieden voor normalisatie/optionele filtering (uitgebreid)
 CANONICAL_DEELGEBIEDEN = {
     "Hoornse Hop",
     "IJmeer",
     "Markermeer Noord",
     "Markermeer Midden",
     "Markermeer Zuid",
+    "Zwartemeer",
+    "Ketelmeer",
+    "Vossemeer",
+    "Drontermeer",
+    "Veluwemeer",
+    "Wolderwijd",
+    "Nuldernauw",
+    "Eemmeer",
+    "Gooimeer",
+    "Nijkerkernauw",
+    "Reevediep",
 }
+# Filter uitzetten (default) omdat jaargangen andere deelgebieden hebben
+CANONICAL_ONLY = False
 
 # ------------------------------------------------------------
 # Normalisatie helpers
 # ------------------------------------------------------------
-
 def _key(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
@@ -46,6 +67,7 @@ def normalize_deelgebied(val) -> str | None:
     }
     if k in mapping:
         return mapping[k]
+    # Soft matches
     if "ijmeer" in k:
         return "IJmeer"
     if "hoornsehop" in k:
@@ -58,16 +80,36 @@ def normalize_deelgebied(val) -> str | None:
         return "Markermeer Midden"
     if "markermeer" in k and "zuid" in k:
         return "Markermeer Zuid"
+    # overige deelgebieden intact
     return s
 
 
+def _keep_deelgebied(dg: str | None) -> bool:
+    if dg is None:
+        return False
+    s = str(dg).strip()
+    if s == "" or s.lower() in {"nan", "none"}:
+        return False
+    if CANONICAL_ONLY:
+        return s in CANONICAL_DEELGEBIEDEN
+    if any(t in s.lower() for t in ["totaal", "total", "overall", "som"]):
+        return False
+    return True
+
+
 def normalize_soort(val) -> str:
+    """
+    Normaliseer soortnamen robuust.
+
+    Uitbreiding: vang ook de 2023-typo 'polymorfa' af. 
+    """
     if pd.isna(val):
         return "onbekend"
     s = str(val).strip().lower()
     if "bugensis" in s:
         return "D. bugensis (quagga)"
-    if "polymorpha" in s:
+    # typo tolerant: polymorfa -> polymorpha
+    if "polymorpha" in s or "polymorfa" in s:
         return "D. polymorpha (driehoek)"
     return str(val).strip()
 
@@ -83,17 +125,20 @@ def _clean_header_token(x) -> str:
 
 def _has_lengteklasse_token(*tokens: str) -> bool:
     txt = " ".join([t for t in tokens if t]).lower()
-    return "lengteklasse" in txt
+    # accepteer zowel 'Lengteklasse (mm)' als 'Lengte (mm)'
+    if "lengteklasse" in txt:
+        return True
+    if "lengte" in txt and "mm" in txt:
+        return True
+    return False
 
 
 # ------------------------------------------------------------
 # RD -> WGS84 (benadering)
 # ------------------------------------------------------------
-
 def rd_to_wgs84(x: float, y: float) -> tuple[float, float]:
     p = (x - 155000.0) / 100000.0
     q = (y - 463000.0) / 100000.0
-
     K = [
         (0, 1, 3235.65389),
         (2, 0, -32.58297),
@@ -121,60 +166,173 @@ def rd_to_wgs84(x: float, y: float) -> tuple[float, float]:
         (2, 0, -0.00022),
         (5, 0, 0.00026),
     ]
-
     phi = 52.15517440
     lam = 5.38720621
-
     for a, b, c in K:
         phi += c * (p**a) * (q**b) / 3600.0
     for a, b, c in L:
         lam += c * (p**a) * (q**b) / 3600.0
-
     return phi, lam
+
+
+# ------------------------------------------------------------
+# Helpers: vind header-rij in sheet (robust)
+# ------------------------------------------------------------
+def _find_header_row(
+    xlsx: Path,
+    sheet: str,
+    needle: str,
+    *,
+    prefer_first_col: bool = True,
+    whole_word: bool = True,
+    max_rows: int = 80,
+) -> int | None:
+    raw = pd.read_excel(xlsx, sheet_name=sheet, header=None, engine="openpyxl", nrows=max_rows)
+    patt = re.escape(needle)
+    if whole_word:
+        patt = rf"\b{patt}\b"
+    if prefer_first_col and raw.shape[1] > 0:
+        s0 = raw.iloc[:, 0].astype(str)
+        hits0 = s0.str.contains(patt, case=False, na=False, regex=True)
+        if hits0.any():
+            return int(hits0.idxmax())
+    for i in range(len(raw)):
+        row = raw.iloc[i].astype(str)
+        if row.str.contains(patt, case=False, na=False, regex=True).any():
+            return int(i)
+    return None
+
+
+# ------------------------------------------------------------
+# Parquet sanitizers (voorkomt pyarrow mixed-type errors)
+# ------------------------------------------------------------
+def _decode_bytes(x):
+    if isinstance(x, (bytes, bytearray)):
+        try:
+            return x.decode("utf-8")
+        except Exception:
+            try:
+                return x.decode("latin-1")
+            except Exception:
+                return str(x)
+    return x
+
+
+def _coerce_numeric_if_mostly_numeric(s: pd.Series, threshold: float = 0.8) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(s):
+        return s
+    ss = s.map(_decode_bytes)
+    ss_str = ss.astype(str).str.strip()
+    ss_str = ss_str.str.replace("\u00a0", " ", regex=False)
+    ss_str = ss_str.replace({"": np.nan, "nan": np.nan, "None": np.nan, "<NA>": np.nan})
+    cand = ss_str.copy().str.replace("%", "", regex=False).str.replace(",", ".", regex=False)
+    num = pd.to_numeric(cand, errors="coerce")
+    non_null = ss_str.notna().sum()
+    if non_null == 0:
+        return ss_str.astype("string")
+    ratio = num.notna().sum() / non_null
+    if ratio >= threshold:
+        return num
+    return ss_str.astype("string")
+
+
+def _sanitize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if out[c].dtype == object or pd.api.types.is_object_dtype(out[c]):
+            out[c] = _coerce_numeric_if_mostly_numeric(out[c])
+    return out
 
 
 # ------------------------------------------------------------
 # Bijlage 4 -> measurements.parquet
 # ------------------------------------------------------------
+def read_bijlage4_measurements(xlsx: Path) -> pd.DataFrame:
+    """
+    Lees Bijlage 4 robuust over jaargangen.
+    Ondersteunt o.a.:
+    - 2021: kolommen X/Y, diepte '(in m)', biovolumes 'Bugensis' en 'Polymorpha'
+    - 2023/2024: x/y, 'Waterdiepte (m)', 'Driehoeksmossel' en 'Quaggamossel'
+    """
+    header_row = _find_header_row(xlsx, "Bijlage 4", "Deelgebied", prefer_first_col=False, whole_word=False)
+    if header_row is None:
+        header_row = 3
+    df = pd.read_excel(xlsx, sheet_name="Bijlage 4", header=header_row, engine="openpyxl")
 
-def read_bijlage4_measurements() -> pd.DataFrame:
-    df = pd.read_excel(XLSX, sheet_name="Bijlage 4", header=3, engine="openpyxl")
+    def _norm_col(c):
+        # behoud int-achtige kolomnamen als '1', '2', ... zodat we hap-kolommen kunnen herkennen
+        try:
+            if isinstance(c, (int, float)) and not pd.isna(c):
+                if float(c).is_integer():
+                    return str(int(float(c)))
+        except Exception:
+            pass
+        return str(c).replace("\u00a0", " ").replace("\n", " ").strip()
 
-    df = df[df["Deelgebied"].notna()].copy()
-    df["Deelgebied"] = df["Deelgebied"].apply(normalize_deelgebied)
-    df = df[df["Deelgebied"].isin(CANONICAL_DEELGEBIEDEN)].copy()
+    df.columns = [_norm_col(c) for c in df.columns]
 
-    df = df.rename(
-        columns={
-            "x": "x_planned_rd",
-            "y": "y_planned_rd",
-            "x.1": "x_rd",
-            "y.1": "y_rd",
-            "Waterdiepte (m)": "diepte_m",
-            "Driehoeksmossel": "biovol_driehoek_ml",
-            "Quaggamossel": "biovol_quagga_ml",
-            "Mytilidae": "aantallen_mytilidae",
-            "Najaden": "aantallen_najaden",
-        }
-    )
+    # Normaliseer kolomnamen varianten
+    rename_map = {
+        # coords (lower/upper)
+        "x": "x_planned_rd",
+        "y": "y_planned_rd",
+        "x.1": "x_rd",
+        "y.1": "y_rd",
+        "X": "x_planned_rd",
+        "Y": "y_planned_rd",
+        "X.1": "x_rd",
+        "Y.1": "y_rd",
+        # diepte
+        "Waterdiepte (m)": "diepte_m",
+        "Waterdiepte": "diepte_m",
+        "(in m)": "diepte_m",
+        # biovolumes
+        "Driehoeksmossel": "biovol_driehoek_ml",
+        "Quaggamossel": "biovol_quagga_ml",
+        # 2021: soortnamen in biovolume-kop
+        "Polymorpha": "biovol_driehoek_ml",  # D. polymorpha = driehoek
+        "Bugensis": "biovol_quagga_ml",  # D. bugensis = quagga
+        # aantallen
+        "Mytilidae": "aantallen_mytilidae",
+        "Najaden": "aantallen_najaden",
+        "Corbicula": "aantallen_corbicula",
+        "Aantal C. fluminea": "aantallen_corbicula",
+        # datum varianten
+        "Datum en tijd": "Datum",
+        "jjjj-mm-dd hh:mm:ss": "Datum",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    if "Corbicula" in df.columns:
-        df = df.rename(columns={"Corbicula": "aantallen_corbicula"})
-    if "Corbicula.1" in df.columns:
-        df = df.rename(columns={"Corbicula.1": "aantallen_corbicula_dup"})
-
-    for i in range(1, 6):
-        if i in df.columns:
-            df = df.rename(columns={i: f"sedimenttype_{i}"})
+    # Happen: sedimenttype / lutum / PAS
+    for i in range(1, 11):
+        if str(i) in df.columns:
+            df = df.rename(columns={str(i): f"sedimenttype_{i}"})
         if f"{i}.1" in df.columns:
             df = df.rename(columns={f"{i}.1": f"lutum_{i}"})
         if f"{i}.2" in df.columns:
             df = df.rename(columns={f"{i}.2": f"PAS_{i}"})
 
-    df["Datum"] = pd.to_datetime(df["Datum"], errors="coerce").dt.date
+    # Deelgebied aanwezig?
+    if "Deelgebied" not in df.columns:
+        for c in df.columns:
+            if str(c).strip().lower() == "deelgebied":
+                df = df.rename(columns={c: "Deelgebied"})
+                break
+    if "Deelgebied" not in df.columns:
+        raise KeyError(
+            f"Kolom 'Deelgebied' niet gevonden in Bijlage 4 van {xlsx.name}. Kolommen: {list(df.columns)}"
+        )
 
+    df = df[df["Deelgebied"].notna()].copy()
+    df["Deelgebied"] = df["Deelgebied"].apply(normalize_deelgebied)
+    df = df[df["Deelgebied"].apply(_keep_deelgebied)].copy()
+
+    # Datum -> date
+    if "Datum" in df.columns:
+        df["Datum"] = pd.to_datetime(df["Datum"], errors="coerce").dt.date
+
+    # Numeric cols (Locatie NIET forceren! kan string zijn)
     num_cols = [
-        "Locatie",
         "x_planned_rd",
         "y_planned_rd",
         "x_rd",
@@ -184,163 +342,120 @@ def read_bijlage4_measurements() -> pd.DataFrame:
         "biovol_quagga_ml",
         "aantallen_mytilidae",
         "aantallen_corbicula",
-        "aantallen_corbicula_dup",
         "aantallen_najaden",
     ]
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["biovol_totaal_ml"] = df["biovol_driehoek_ml"].fillna(0) + df["biovol_quagga_ml"].fillna(0)
-    df["ratio_driehoek_quagga"] = np.where(
-        df["biovol_quagga_ml"] > 0,
-        df["biovol_driehoek_ml"] / df["biovol_quagga_ml"],
-        np.nan,
-    )
+    # Biovolume total/ratio
+    if "biovol_driehoek_ml" in df.columns or "biovol_quagga_ml" in df.columns:
+        a = df["biovol_driehoek_ml"] if "biovol_driehoek_ml" in df.columns else 0
+        b = df["biovol_quagga_ml"] if "biovol_quagga_ml" in df.columns else 0
+        df["biovol_totaal_ml"] = pd.to_numeric(a, errors="coerce").fillna(0) + pd.to_numeric(b, errors="coerce").fillna(0)
+        if "biovol_driehoek_ml" in df.columns and "biovol_quagga_ml" in df.columns:
+            df["ratio_driehoek_quagga"] = np.where(
+                df["biovol_quagga_ml"] > 0,
+                df["biovol_driehoek_ml"] / df["biovol_quagga_ml"],
+                np.nan,
+            )
 
-    latlon = df[["x_rd", "y_rd"]].apply(
-        lambda r: rd_to_wgs84(float(r["x_rd"]), float(r["y_rd"])),
-        axis=1,
-    )
-    df["lat"] = [t[0] for t in latlon]
-    df["lon"] = [t[1] for t in latlon]
+    # RD -> WGS84
+    if "x_rd" in df.columns and "y_rd" in df.columns:
+        latlon = df[["x_rd", "y_rd"]].apply(
+            lambda r: rd_to_wgs84(float(r["x_rd"]), float(r["y_rd"])),
+            axis=1,
+        )
+        df["lat"] = [t[0] for t in latlon]
+        df["lon"] = [t[1] for t in latlon]
 
     return df
 
 
 # ------------------------------------------------------------
-# Bijlage 7 -> adv_m2_locations.parquet (optioneel)
+# Bijlage 7 -> adv_m2_locations.parquet
 # ------------------------------------------------------------
-
-def read_bijlage7_adv_m2() -> pd.DataFrame:
-    df = pd.read_excel(XLSX, sheet_name="Bijlage 7", header=3, engine="openpyxl")
-
-    df = df[df["Deelgebied"].notna()].copy()
-    df["Deelgebied"] = df["Deelgebied"].apply(normalize_deelgebied)
-    df = df[df["Deelgebied"].isin(CANONICAL_DEELGEBIEDEN)].copy()
-
+def read_bijlage7_adv_m2(xlsx: Path) -> pd.DataFrame:
+    header_row = _find_header_row(xlsx, "Bijlage 7", "Deelgebied", prefer_first_col=False, whole_word=False)
+    if header_row is None:
+        header_row = 3
+    df = pd.read_excel(xlsx, sheet_name="Bijlage 7", header=header_row, engine="openpyxl")
+    df.columns = [str(c).replace("\u00a0", " ").replace("\n", " ").strip() for c in df.columns]
+    if "Deelgebied" in df.columns:
+        df = df[df["Deelgebied"].notna()].copy()
+        df["Deelgebied"] = df["Deelgebied"].apply(normalize_deelgebied)
+        df = df[df["Deelgebied"].apply(_keep_deelgebied)].copy()
     for c in ["Berekend ADV bugensis (mg/m2)", "Berekend ADV polymorpha (mg/m2)"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    if "Locatie" in df.columns:
-        df["Locatie"] = pd.to_numeric(df["Locatie"], errors="coerce")
-
     return df
 
 
 # ------------------------------------------------------------
-# Helpers: vind header-rij in sheet (robust)
+# Populatie Bijlage 5a/5b -> tidy
 # ------------------------------------------------------------
-
-def _find_header_row(
-    sheet: str,
-    needle: str,
-    *,
-    prefer_first_col: bool = True,
-    whole_word: bool = True,
-    max_rows: int = 80,
-) -> int | None:
-    """Zoek de header-rij in een Excel-sheet.
-
-    Robuustheid:
-    - In Bijlage 5b komt het woord 'lengteklasse' ook voor in titelregels als 'lengteklassen'.
-      Met `whole_word=True` matchen we alleen op het *woord* 'Lengteklasse' (\b...\b).
-    - We zoeken eerst in de eerste kolom, omdat de echte header daar meestal staat.
-    """
-
-    raw = pd.read_excel(XLSX, sheet_name=sheet, header=None, engine="openpyxl", nrows=max_rows)
-
-    patt = re.escape(needle)
-    if whole_word:
-        patt = rf"\b{patt}\b"
-
-    if prefer_first_col and raw.shape[1] > 0:
-        s0 = raw.iloc[:, 0].astype(str)
-        hits0 = s0.str.contains(patt, case=False, na=False, regex=True)
-        if hits0.any():
-            return int(hits0.idxmax())
-
-    for i in range(len(raw)):
-        row = raw.iloc[i].astype(str)
-        if row.str.contains(patt, case=False, na=False, regex=True).any():
-            return int(i)
-
-    return None
-
-
-# ------------------------------------------------------------
-# Populatie Bijlage 5a/5b -> tidy (ROBUST)
-# ------------------------------------------------------------
-
 def _ffill_multiindex_level0(cols: pd.MultiIndex) -> pd.MultiIndex:
-    """Forward-fill het eerste level van een 2-level MultiIndex.
-
-    Excel gebruikt vaak merged cells voor deelgebieden (bijv. 'Markermeer Noord' over 2 kolommen).
-    Pandas leest dat als lege waarden/NaN in de vervolgkolommen. Door level-0 te ffill'en krijgen
-    beide subkolommen weer hetzelfde deelgebied.
-    """
-
     lvl0 = pd.Series(cols.get_level_values(0))
     lvl1 = pd.Series(cols.get_level_values(1))
-
-    # maak lege tokens NaN zodat ffill werkt
     lvl0 = lvl0.replace(to_replace=r"^Unnamed:.*", value=np.nan, regex=True)
     lvl0 = lvl0.replace("", np.nan)
     lvl0 = lvl0.ffill().fillna("")
-
     return pd.MultiIndex.from_arrays([lvl0.values, lvl1.values])
 
 
 def _parse_numeric_series(s: pd.Series) -> pd.Series:
-    """Maak een kolom robuust numeriek.
-
-    Ondersteunt o.a. waarden als '18,12%' of '18,12 %' (komma-decimaal en percent-teken).
-    Als de kolom al numeriek is, wordt deze onveranderd teruggegeven.
-    """
-
     if pd.api.types.is_numeric_dtype(s):
         return s
-
     ss = s.astype(str).str.strip()
-    ss = ss.str.replace("\u00a0", " ", regex=False)  # non-breaking spaces
+    ss = ss.str.replace("\u00a0", " ", regex=False)
     ss = ss.str.replace("%", "", regex=False)
     ss = ss.str.replace(",", ".", regex=False)
     ss = ss.replace({"": np.nan, "nan": np.nan, "None": np.nan})
-
     return pd.to_numeric(ss, errors="coerce")
 
 
-def read_populatie_tidy(sheet: str, metric: str) -> pd.DataFrame:
-    """Robuust tidy maken voor Bijlage 5a/5b.
-
-    Lost op:
-    - Header-detectie: voorkomt dat titelregels met 'lengteklassen' per ongeluk als header worden gebruikt.
-    - Merged cells: forward-fill van deelgebied in MultiIndex level 0.
-    - Percentages als tekst: '18,12%' wordt numeriek.
+def read_populatie_tidy(xlsx: Path, sheet: str, metric: str) -> pd.DataFrame:
+    """
+    Robuust tidy maken voor Bijlage 5a/5b.
+    Variaties tussen jaren:
+    - Sommige jaren (o.a. 2021 Bijlage 5b) hebben deelgebiednamen op de rij BOVEN de rij met 'Lengteklasse (mm)'.
+    - Andere jaren hebben de 2-level header anders ingedeeld.
 
     Output kolommen:
     - lengteklasse_mm (int)
-    - deelgebied (canonical)
-    - soort (canonical)
+    - deelgebied (str)
+    - soort (str)
     - waarde (float)
-    - metric ("count" of "percent")
+    - metric ('count' of 'percent')
     """
-
-    header_row = _find_header_row(sheet, "Lengteklasse", prefer_first_col=True, whole_word=True)
-    if header_row is None:
+    lengte_row = _find_header_row(xlsx, sheet, "Lengteklasse", prefer_first_col=True, whole_word=True)
+    if lengte_row is None:
+        lengte_row = _find_header_row(xlsx, sheet, "Lengte (mm)", prefer_first_col=True, whole_word=False)
+    if lengte_row is None:
         return pd.DataFrame(columns=["lengteklasse_mm", "deelgebied", "soort", "waarde", "metric"])
 
-    df = pd.read_excel(
-        XLSX,
-        sheet_name=sheet,
-        header=[header_row, header_row + 1],
-        engine="openpyxl",
+    header_top = max(int(lengte_row) - 1, 0)
+    preview = pd.read_excel(
+        xlsx, sheet_name=sheet, header=None, engine="openpyxl", nrows=int(lengte_row) + 1
     )
+    top_row = preview.iloc[header_top].astype(str).str.strip()
+
+    has_deelgebied = False
+    for val in top_row.values:
+        dg = normalize_deelgebied(val)
+        if dg is not None and _keep_deelgebied(dg) and dg in CANONICAL_DEELGEBIEDEN:
+            has_deelgebied = True
+            break
+
+    if has_deelgebied:
+        df = pd.read_excel(xlsx, sheet_name=sheet, header=[header_top, int(lengte_row)], engine="openpyxl")
+    else:
+        df = pd.read_excel(
+            xlsx, sheet_name=sheet, header=[int(lengte_row), int(lengte_row) + 1], engine="openpyxl"
+        )
 
     df = df.dropna(axis=1, how="all")
 
-    # Clean MultiIndex headers (strip + remove 'Unnamed')
     cleaned_cols: list[tuple[str, str]] = []
     for c0, c1 in df.columns:
         a = _clean_header_token(c0)
@@ -348,20 +463,14 @@ def read_populatie_tidy(sheet: str, metric: str) -> pd.DataFrame:
         cleaned_cols.append((a, b))
     df.columns = pd.MultiIndex.from_tuples(cleaned_cols)
 
-    # Herstel merged headers
     df.columns = _ffill_multiindex_level0(df.columns)
 
-    # 1) Vind alle lengteklasse kolommen (kan >1 zijn door duplicaten)
     lengte_cols = [col for col in df.columns if _has_lengteklasse_token(col[0], col[1])]
     if not lengte_cols:
-        lengte_cols = [col for col in df.columns if "lengteklasse" in str(col).lower()]
+        lengte_cols = [col for col in df.columns if "lengte" in str(col).lower() and "mm" in str(col).lower()]
     if not lengte_cols:
-        raise ValueError(
-            f"Kon geen Lengteklasse-kolom vinden in sheet '{sheet}'. "
-            f"Gevonden kolommen: {list(df.columns)}"
-        )
+        raise ValueError(f"Kon geen lengtekolom vinden in sheet '{sheet}'.")
 
-    # 2) Pak een 1D Series uit (kan DataFrame zijn bij duplicate MultiIndex keys)
     lk_sel = df[lengte_cols[0]]
     if isinstance(lk_sel, pd.DataFrame):
         chosen = None
@@ -379,10 +488,8 @@ def read_populatie_tidy(sheet: str, metric: str) -> pd.DataFrame:
     df = df.loc[keep].copy()
     lk = lk.loc[keep].astype(int)
 
-    # drop alle lengteklasse kolommen (ook duplicaten)
     df = df.drop(columns=lengte_cols, errors="ignore")
 
-    # 3) Zet overige kolommen om naar tidy
     parts: list[pd.DataFrame] = []
     for (h0, h1) in df.columns:
         deelgebied = None
@@ -391,32 +498,34 @@ def read_populatie_tidy(sheet: str, metric: str) -> pd.DataFrame:
         dg0 = normalize_deelgebied(h0)
         dg1 = normalize_deelgebied(h1)
 
-        if dg0 in CANONICAL_DEELGEBIEDEN and ("bugensis" in str(h1).lower() or "polymorpha" in str(h1).lower()):
+        if _keep_deelgebied(dg0) and ("bugensis" in str(h1).lower() or "polymorpha" in str(h1).lower() or "polymorfa" in str(h1).lower()):
             deelgebied = dg0
             soort = normalize_soort(h1)
-        elif dg1 in CANONICAL_DEELGEBIEDEN and ("bugensis" in str(h0).lower() or "polymorpha" in str(h0).lower()):
+        elif _keep_deelgebied(dg1) and ("bugensis" in str(h0).lower() or "polymorpha" in str(h0).lower() or "polymorfa" in str(h0).lower()):
             deelgebied = dg1
             soort = normalize_soort(h0)
         else:
-            # fallback: zoek tokens in beide velden
-            if dg0 in CANONICAL_DEELGEBIEDEN:
+            if _keep_deelgebied(dg0):
                 deelgebied = dg0
-            elif dg1 in CANONICAL_DEELGEBIEDEN:
+            elif _keep_deelgebied(dg1):
                 deelgebied = dg1
 
             token = (str(h0).lower() + " " + str(h1).lower())
             if "bugensis" in token:
                 soort = "D. bugensis (quagga)"
-            elif "polymorpha" in token:
+            elif "polymorpha" in token or "polymorfa" in token:
                 soort = "D. polymorpha (driehoek)"
 
         if deelgebied is None or soort is None:
             continue
-        if deelgebied not in CANONICAL_DEELGEBIEDEN:
+
+        if deelgebied not in CANONICAL_DEELGEBIEDEN and CANONICAL_ONLY:
             continue
+        if not CANONICAL_ONLY:
+            if re.fullmatch(r"\d+(?:\.\d+)?", str(deelgebied).strip()):
+                continue
 
         values = _parse_numeric_series(df[(h0, h1)])
-
         parts.append(
             pd.DataFrame(
                 {
@@ -434,26 +543,95 @@ def read_populatie_tidy(sheet: str, metric: str) -> pd.DataFrame:
 
     out = pd.concat(parts, ignore_index=True)
     out = out[out["waarde"].notna()].copy()
-
     return out
 
 
 # ------------------------------------------------------------
-# Bijlage 6 -> adv_lenclass.parquet (tidy/long)
+# Bijlage 6 (ROBUST) -> adv_lenclass.parquet
 # ------------------------------------------------------------
+def _collapse_columns_to_3levels(cols: pd.Index) -> pd.MultiIndex:
+    """
+    Converteer MultiIndex met 2/3/4+ levels naar een uniforme 3-level MultiIndex:
+    (deelgebied, soort, metric).
 
-def read_bijlage6_adv_lenclass_tidy() -> pd.DataFrame:
-    header_row = _find_header_row("Bijlage 6", "SL", prefer_first_col=False, whole_word=False)
+    - Bij 3 levels: schoonmaken, klaar.
+    - Bij 4+ levels: level0=deelgebied, level1=soort, level2=join(remaining levels).
+    - Bij 2 levels: level0=deelgebied, level1="", level2=level1 (alles in metric); parsing gebruikt later tokens.
+    """
+    if not isinstance(cols, pd.MultiIndex):
+        # Single level: maak 3-level met alles in metric
+        tuples = [(str(c), "", "") for c in cols]
+        return pd.MultiIndex.from_tuples(tuples)
+
+    n = cols.nlevels
+    new_tuples: list[tuple[str, str, str]] = []
+
+    if n == 3:
+        for a, b, c in cols:
+            new_tuples.append((_clean_header_token(a), _clean_header_token(b), _clean_header_token(c)))
+        return pd.MultiIndex.from_tuples(new_tuples)
+
+    if n >= 4:
+        for tup in cols:
+            a = _clean_header_token(tup[0])
+            b = _clean_header_token(tup[1])
+            rest = " ".join([_clean_header_token(x) for x in tup[2:]]).strip()
+            new_tuples.append((a, b, rest))
+        return pd.MultiIndex.from_tuples(new_tuples)
+
+    # n == 2
+    for a, b in cols:
+        new_tuples.append((_clean_header_token(a), "", _clean_header_token(b)))
+    return pd.MultiIndex.from_tuples(new_tuples)
+
+
+def _read_excel_with_multiheader_fallbacks(xlsx: Path, sheet: str, header_row: int) -> pd.DataFrame:
+    """
+    Lees Excel met variabele multiheader diepte.
+    Probeert (3, 4, 2) headerlagen vanaf header_row.
+    """
+    attempts = [
+        [header_row, header_row + 1, header_row + 2],               
+        [header_row, header_row + 1, header_row + 2, header_row + 3],
+        [header_row, header_row + 1],
+    ]
+    last_exc: Exception | None = None
+
+    for hdr in attempts:
+        try:
+            df = pd.read_excel(xlsx, sheet_name=sheet, header=hdr, engine="openpyxl")
+            # Als pandas hier zonder error komt, returnen we; verdere checks doen we in de caller.
+            return df
+        except Exception as e:
+            last_exc = e
+            continue
+
+    # Als alles faalt: raise laatste error
+    raise last_exc if last_exc is not None else RuntimeError("Onbekende fout bij inlezen Excel.")
+
+
+def read_bijlage6_adv_lenclass_tidy(xlsx: Path) -> pd.DataFrame:
+    """
+    Robuust uitlezen van Bijlage 6, tolerant voor:
+    - verschoven header door extra lege regels (jaarvarianten) 
+    - MultiIndex variaties (2/3/4+ levels)
+    - typos in headers (bv. 'polymorfa')
+    """
+    # 1) Vind header-rij zo specifiek mogelijk (SL (mm) eerst)
+    header_row = _find_header_row(xlsx, "Bijlage 6", "SL (mm)", prefer_first_col=True, whole_word=False)
+    if header_row is None:
+        header_row = _find_header_row(xlsx, "Bijlage 6", "SL", prefer_first_col=True, whole_word=True)
+
     if header_row is None:
         return pd.DataFrame(columns=["sl_mm", "deelgebied", "soort", "adv_mg_per_mossel", "n_verast"])
 
-    df = pd.read_excel(
-        XLSX,
-        sheet_name="Bijlage 6",
-        header=[header_row, header_row + 1, header_row + 2],
-        engine="openpyxl",
-    )
+    # 2) Lees met fallback headerdieptes
+    df = _read_excel_with_multiheader_fallbacks(xlsx, "Bijlage 6", header_row)
 
+    # 3) Normaliseer kolommen naar 3 levels
+    df.columns = _collapse_columns_to_3levels(df.columns)
+
+    # 4) Maak SL-kolom herkenning robuust
     cleaned = []
     for c0, c1, c2 in df.columns:
         a = _clean_header_token(c0)
@@ -466,6 +644,13 @@ def read_bijlage6_adv_lenclass_tidy() -> pd.DataFrame:
     df.columns = pd.MultiIndex.from_tuples(cleaned)
 
     sl_col = ("SL", "SL", "SL")
+    if sl_col not in df.columns:
+        # Als SL toch niet in de header zit door rare export: fallback zoek in alle kolommen
+        sl_candidates = [col for col in df.columns if "sl" in " ".join(map(str, col)).lower()]
+        if not sl_candidates:
+            return pd.DataFrame(columns=["sl_mm", "deelgebied", "soort", "adv_mg_per_mossel", "n_verast"])
+        sl_col = sl_candidates[0]
+
     sl = pd.to_numeric(df[sl_col], errors="coerce")
     keep = sl.notna()
     df = df.loc[keep].copy()
@@ -473,24 +658,38 @@ def read_bijlage6_adv_lenclass_tidy() -> pd.DataFrame:
 
     cols = [c for c in df.columns if c != sl_col]
 
+    # 5) Bouw mapping per (deelgebied, soort) naar adv/n-kolommen
     pair_map: dict[tuple[str, str], dict[str, tuple[str, str, str]]] = {}
+
     for dg_raw, soort_raw, metric_raw in cols:
         dg = normalize_deelgebied(dg_raw)
-        if dg is None or dg not in CANONICAL_DEELGEBIEDEN:
+        if not _keep_deelgebied(dg):
             continue
-        soort = normalize_soort(soort_raw)
+
+        # soort_raw kan soms leeg zijn (bij 2-level headers); dan zit info in metric_raw
+        soort = normalize_soort(soort_raw if str(soort_raw).strip() else metric_raw)
+
         metric_name = str(metric_raw).strip().lower()
+        # extra tolerant: soms zit metric in soort_raw
+        metric_name2 = (str(soort_raw).strip().lower() + " " + str(metric_raw).strip().lower()).strip()
 
         pair_map.setdefault((dg, soort), {})
-        if "adv" in metric_name:
+
+        # ADV: detecteer op 'adv' in metric tokens
+        if "adv" in metric_name or "adv" in metric_name2:
             pair_map[(dg, soort)]["adv"] = (dg_raw, soort_raw, metric_raw)
-        if metric_name.startswith("n") or metric_name == "n":
+
+        # N: detecteer op n*, of 'aantal'
+        if metric_name.startswith("n") or metric_name == "n" or "aantal" in metric_name:
+            pair_map[(dg, soort)]["n"] = (dg_raw, soort_raw, metric_raw)
+        elif metric_name2.startswith("n") or "aantal" in metric_name2:
             pair_map[(dg, soort)]["n"] = (dg_raw, soort_raw, metric_raw)
 
     records = []
     for (dg, soort), maps in pair_map.items():
         if "adv" not in maps:
             continue
+
         adv_col = maps["adv"]
         n_col = maps.get("n")
 
@@ -514,44 +713,123 @@ def read_bijlage6_adv_lenclass_tidy() -> pd.DataFrame:
 
     out = pd.concat(records, ignore_index=True)
     out = out[out["adv_mg_per_mossel"].notna()].copy()
-
     return out
+
+
+# ------------------------------------------------------------
+# Main helpers
+# ------------------------------------------------------------
+def _extract_year_from_filename(p: Path) -> str | None:
+    m = re.search(r"_(\d{4})\.xlsx$", p.name)
+    return m.group(1) if m else None
+
+
+def _required_files_exist(files: list[Path]) -> tuple[bool, list[Path]]:
+    missing = [p for p in files if not p.exists()]
+    return (len(missing) == 0, missing)
+
+
+def process_one_dataset(xlsx: Path, outdir: Path) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    measurements = _sanitize_for_parquet(read_bijlage4_measurements(xlsx))
+    measurements.to_parquet(outdir / "measurements.parquet", index=False)
+
+    adv_m2 = _sanitize_for_parquet(read_bijlage7_adv_m2(xlsx))
+    adv_m2.to_parquet(outdir / "adv_m2_locations.parquet", index=False)
+
+    pop_counts = _sanitize_for_parquet(read_populatie_tidy(xlsx, "Bijlage 5a", metric="count"))
+    pop_counts.to_parquet(outdir / "populatie_counts.parquet", index=False)
+
+    pop_percent = _sanitize_for_parquet(read_populatie_tidy(xlsx, "Bijlage 5b", metric="percent"))
+    pop_percent.to_parquet(outdir / "populatie_percent.parquet", index=False)
+
+    adv_len = _sanitize_for_parquet(read_bijlage6_adv_lenclass_tidy(xlsx))
+    adv_len.to_parquet(outdir / "adv_lenclass.parquet", index=False)
 
 
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
-
-def main():
-    if not XLSX.exists():
-        raise FileNotFoundError(f"Excelbestand niet gevonden: {XLSX.resolve()}")
-
-    measurements = read_bijlage4_measurements()
-    measurements.to_parquet(OUTDIR / "measurements.parquet", index=False)
-
-    adv_m2 = read_bijlage7_adv_m2()
-    adv_m2.to_parquet(OUTDIR / "adv_m2_locations.parquet", index=False)
-
-    pop_counts = read_populatie_tidy("Bijlage 5a", metric="count")
-    pop_counts.to_parquet(OUTDIR / "populatie_counts.parquet", index=False)
-
-    pop_percent = read_populatie_tidy("Bijlage 5b", metric="percent")
-    pop_percent.to_parquet(OUTDIR / "populatie_percent.parquet", index=False)
-
-    adv_len = read_bijlage6_adv_lenclass_tidy()
-    adv_len.to_parquet(OUTDIR / "adv_lenclass.parquet", index=False)
-
-    print("✅ Parquet-bestanden geschreven naar:", OUTDIR.resolve())
-    print("✅ Deelgebieden measurements:", sorted(measurements["Deelgebied"].unique().tolist()))
-    print(
-        "✅ Deelgebieden populatie_counts:",
-        sorted(pop_counts["deelgebied"].unique().tolist()) if not pop_counts.empty else [],
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Zet mosselmonitoring Excel (Bijlagen 4/5/6/7) om naar Parquet. "
+            "Standaard worden REQUIRED_XLSX (2024/2023/2021) allemaal verwerkt."
+        )
     )
-    print(
-        "✅ Deelgebieden populatie_percent:",
-        sorted(pop_percent["deelgebied"].unique().tolist()) if not pop_percent.empty else [],
+    parser.add_argument(
+        "--xlsx",
+        type=str,
+        default=None,
+        help="Pad naar één specifiek Excelbestand (verwerkt alleen dit bestand).",
     )
-    print("✅ adv_lenclass kolommen:", list(adv_len.columns))
+    parser.add_argument(
+        "--pattern",
+        type=str,
+        default=None,
+        help="Optioneel: glob pattern voor verwerking van alle matches.",
+    )
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        default=str(OUTDIR),
+        help="Output directory (default: processed)",
+    )
+    parser.add_argument(
+        "--canonical-only",
+        action="store_true",
+        help="Filter deelgebieden op CANONICAL_DEELGEBIEDEN (legacy gedrag).",
+    )
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop direct bij de eerste fout. Standaard probeert het script alle bestanden af te werken.",
+    )
+    args = parser.parse_args()
+
+    global CANONICAL_ONLY
+    CANONICAL_ONLY = bool(args.canonical_only)
+
+    outroot = Path(args.outdir)
+    outroot.mkdir(exist_ok=True)
+
+    # 1) Eén specifiek bestand
+    if args.xlsx:
+        xlsx = Path(args.xlsx)
+        if not xlsx.exists():
+            raise FileNotFoundError(f"Excelbestand niet gevonden: {xlsx.resolve()}")
+        year = _extract_year_from_filename(xlsx) or "unknown"
+        process_one_dataset(xlsx, outroot / year)
+        print(f"✅ Klaar: {xlsx.name}")
+        return
+
+    # 2) Pattern mode
+    if args.pattern:
+        files = [p for p in sorted(Path(".").glob(args.pattern)) if p.is_file()]
+        if not files:
+            raise FileNotFoundError(f"Geen Excelbestanden gevonden met pattern: {args.pattern}")
+    else:
+        ok, missing = _required_files_exist(REQUIRED_XLSX)
+        if not ok:
+            raise FileNotFoundError("Niet alle vereiste Excelbestanden gevonden: " + ", ".join(p.name for p in missing))
+        files = list(REQUIRED_XLSX)
+
+    errors: list[tuple[Path, Exception]] = []
+    for f in files:
+        year = _extract_year_from_filename(f) or "unknown"
+        try:
+            process_one_dataset(f, outroot / year)
+            print(f"✅ Klaar: {f.name} -> {outroot / year}")
+        except Exception as e:
+            errors.append((f, e))
+            print(f"❌ Fout bij {f.name}: {e}")
+            if args.stop_on_error:
+                raise
+
+    if errors:
+        msg = "\n".join([f"- {p.name}: {type(e).__name__}: {e}" for p, e in errors])
+        raise RuntimeError("Verwerking afgerond maar met fouten in één of meer bestanden:\n" + msg)
 
 
 if __name__ == "__main__":

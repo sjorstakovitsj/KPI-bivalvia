@@ -1,22 +1,53 @@
-# pages/02_🗺️_Kaart.py
-import streamlit as st
-import pandas as pd
-import numpy as np
+# 2_Kaart.py
+# Kaartpagina (Folium) – mosselkartering
+
+import re
+
+import branca.colormap as cm
 import folium
+import numpy as np
+import pandas as pd
+import streamlit as st
 from folium import FeatureGroup
 from folium.features import DivIcon
 from streamlit_folium import st_folium
-import branca.colormap as cm
-from pathlib import Path
-import re
 
-from utils import load_data  # geen toestand/trend/bedekking imports
+from utils import load_data, render_sidebar, rd_to_wgs84
 
 st.set_page_config(page_title="Kaart – Mosselkartering", layout="wide")
+
+# -----------------------------
+# Gedeelde sidebar (zelfde op alle pagina's)
+# -----------------------------
+ui = render_sidebar(title="Mosselkartering")
+years_sel = list(ui.get("years", []))
+combine_years = bool(ui.get("combine_years", False))
+keep_only_canonical = bool(ui.get("keep_only_canonical", False))
+
 st.title("🗺️ Kaart en ruimtelijke analyse")
 
-DATA = load_data()
-meas = DATA["measurements"].copy()
+if not years_sel:
+    st.warning("Selecteer in de sidebar ten minste één monitoringsjaar.")
+    st.stop()
+
+
+@st.cache_data(show_spinner=False)
+def _load(years: tuple[str, ...], combine: bool, keep_only: bool):
+    return load_data(years=list(years), combine_years=combine, keep_only_canonical=keep_only)
+
+
+DATA = _load(tuple(years_sel), combine_years, keep_only_canonical)
+
+meas = DATA.get("measurements", pd.DataFrame()).copy()
+adv7 = DATA.get("adv_m2", pd.DataFrame()).copy()
+
+if meas.empty:
+    st.error(
+        "Geen meetdata gevonden voor de geselecteerde jaren. "
+        "Controleer of processed/<jaar>/measurements.parquet bestaat en of dataprep.py succesvol heeft gedraaid."
+    )
+    st.stop()
+
 
 # -----------------------------
 # Helpers
@@ -26,6 +57,7 @@ def _safe_float(x, default=np.nan):
         return float(x)
     except Exception:
         return default
+
 
 def _find_col(df: pd.DataFrame, candidates):
     """Zoek een kolomnaam in df op basis van kandidaatnamen (case-insensitive)."""
@@ -41,18 +73,12 @@ def _find_col(df: pd.DataFrame, candidates):
             return lower_map[c2]
     return None
 
+
 def _make_cross_icon(size_px: int = 18, color: str = "#111111") -> DivIcon:
     """Kruis (✖) als DivIcon."""
-    html = f"""
-    <div style="
-        font-size:{size_px}px;
-        color:{color};
-        font-weight:700;
-        transform: translate(-50%, -50%);
-        text-shadow: 0 0 2px rgba(255,255,255,0.85);
-    ">✖</div>
-    """
+    html = f"""<div style=\"font-size:{size_px}px;color:{color};line-height:{size_px}px;\">✖</div>"""
     return folium.DivIcon(html=html)
+
 
 def _scale_radius(v, vmin, vmax, rmin=4, rmax=18):
     """Schaal radius obv waarde (sqrt) voor beter zicht."""
@@ -62,6 +88,45 @@ def _scale_radius(v, vmin, vmax, rmin=4, rmax=18):
     t = max(0.0, min(1.0, t))
     t = np.sqrt(t)
     return rmin + (rmax - rmin) * t
+
+
+def _loc_id(series: pd.Series) -> pd.Series:
+    """Maak een stabiele locatie-id (string) voor merges/labels."""
+    return series.astype(str).str.strip()
+
+
+def _hap_indices(df: pd.DataFrame, prefix: str) -> list[int]:
+    """Detecteer welke hap-indexen aanwezig zijn in de dataset.
+
+    Voorbeelden:
+      - prefix='PAS_' matcht kolommen PAS_1..PAS_10
+      - prefix='lutum_' matcht kolommen lutum_1..lutum_10
+      - prefix='sedimenttype_' matcht kolommen sedimenttype_1..sedimenttype_10
+
+    Dit is cruciaal omdat 2021 10 happen bevat terwijl 2023/2024 vaak 5 happen hebben.
+    """
+    if df is None or df.empty:
+        return []
+    patt = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+    out = []
+    for c in df.columns:
+        m = patt.match(str(c))
+        if m:
+            out.append(int(m.group(1)))
+    out = sorted(set(out))
+    return out
+
+
+# Bepaal max aantal happen per type op basis van aanwezige kolommen
+PAS_HAPS = _hap_indices(meas, "PAS_")
+SED_HAPS = _hap_indices(meas, "sedimenttype_")
+LUT_HAPS = _hap_indices(meas, "lutum_")
+
+# Fallback als kolommen ontbreken (oude parquets): gebruik 5
+PAS_HAPS = PAS_HAPS or list(range(1, 6))
+SED_HAPS = SED_HAPS or list(range(1, 6))
+LUT_HAPS = LUT_HAPS or list(range(1, 6))
+
 
 # --------- 2-delige taart (soortverdeling) ----------
 def _pie_svg_two(
@@ -79,18 +144,19 @@ def _pie_svg_two(
     y = cy - r * np.cos(a)
     large_arc = 1 if p_a > 0.5 else 0
     d1 = f"M {cx},{cy} L {cx},{cy-r} A {r},{r} 0 {large_arc},1 {x:.2f},{y:.2f} Z"
-
     svg = f"""
-    <svg xmlns="http://www.w3.org/2000/svg" width="{2*r}" height="{2*r}">
-      <circle cx="{cx}" cy="{cy}" r="{r}" fill="{color_b}" stroke="{stroke}" stroke-width="1"/>
-      <path d="{d1}" fill="{color_a}" stroke="{stroke}" stroke-width="0.5"/>
-    </svg>
-    """
+<svg width="{2*r}" height="{2*r}" viewBox="0 0 {2*r} {2*r}" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="{cx}" cy="{cy}" r="{r}" fill="{color_b}" stroke="{stroke}" stroke-width="1" />
+  <path d="{d1}" fill="{color_a}" stroke="{stroke}" stroke-width="1" />
+</svg>
+"""
     return svg.strip()
+
 
 # --------- Multi-slice taart (PAS/Sediment/Lutum) ----------
 def _polar_to_xy(cx, cy, r, angle):
     return cx + r * np.sin(angle), cy - r * np.cos(angle)
+
 
 def _wedge_path(cx, cy, r, start_angle, end_angle):
     if end_angle <= start_angle:
@@ -100,32 +166,29 @@ def _wedge_path(cx, cy, r, start_angle, end_angle):
     large_arc = 1 if (end_angle - start_angle) > np.pi else 0
     return f"M {cx},{cy} L {x1:.2f},{y1:.2f} A {r},{r} 0 {large_arc},1 {x2:.2f},{y2:.2f} Z"
 
+
 def _pie_svg_multi(shares: dict, colors: dict, r: int = 14, stroke: str = "#333333") -> str:
     """Multi-slice taart (inline SVG). shares somt ~1."""
     cx, cy = r, r
     items = [(k, float(v)) for k, v in shares.items() if np.isfinite(v) and v > 0]
     items.sort(key=lambda t: t[0])
-
     if not items:
-        return f"""
-        <svg xmlns="http://www.w3.org/2000/svg" width="{2*r}" height="{2*r}">
-          <circle cx="{cx}" cy="{cy}" r="{r}" fill="#eeeeee" stroke="{stroke}" stroke-width="1"/>
-        </svg>
-        """.strip()
+        return f"""<svg width="{2*r}" height="{2*r}" xmlns="http://www.w3.org/2000/svg"></svg>""".strip()
 
-    svg_parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{2*r}" height="{2*r}">']
-    svg_parts.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="#ffffff" stroke="{stroke}" stroke-width="1"/>')
+    svg_parts = [f'<svg width="{2*r}" height="{2*r}" viewBox="0 0 {2*r} {2*r}" xmlns="http://www.w3.org/2000/svg">']
+    svg_parts.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="#ffffff" stroke="{stroke}" stroke-width="1" />')
 
     angle = 0.0
     for k, frac in items:
         end = angle + 2 * np.pi * frac
         path = _wedge_path(cx, cy, r, angle, end)
         col = colors.get(k, "#999999")
-        svg_parts.append(f'<path d="{path}" fill="{col}" stroke="{stroke}" stroke-width="0.3"/>')
+        svg_parts.append(f'<path d="{path}" fill="{col}" stroke="{stroke}" stroke-width="1" />')
         angle = end
 
     svg_parts.append("</svg>")
     return "\n".join(svg_parts).strip()
+
 
 # -----------------------------
 # PAS parsing (letters / Nvt)
@@ -152,6 +215,7 @@ PAS_COLORS = {
     "nvt": "#c7c7c7",
 }
 
+
 def _parse_pas_cell(val) -> list[str]:
     if pd.isna(val):
         return []
@@ -161,7 +225,6 @@ def _parse_pas_cell(val) -> list[str]:
     s = s.replace(" ", "")
     if "nvt" in s:
         return ["nvt"]
-
     tokens = re.split(r"[^a-z]+", s)
     out = []
     for t in tokens:
@@ -172,13 +235,13 @@ def _parse_pas_cell(val) -> list[str]:
             continue
         if all(ch in PAS_KEYS for ch in t) and len(t) > 1:
             out.extend(list(t))
-            continue
     return list(dict.fromkeys(out))
 
-def _pas_distribution_for_row(row) -> tuple[dict, float]:
+
+def _pas_distribution_for_row(row) -> tuple[dict, float, int]:
     weights = {k: 0.0 for k in PAS_KEYS}
     used = 0.0
-    for i in range(1, 6):
+    for i in PAS_HAPS:
         col = f"PAS_{i}"
         if col not in row.index:
             continue
@@ -190,15 +253,15 @@ def _pas_distribution_for_row(row) -> tuple[dict, float]:
             if c in weights:
                 weights[c] += w
         used += 1.0
-
     total = sum(weights.values())
     if total <= 0:
-        return {}, used
+        return {}, used, len(PAS_HAPS)
     shares = {k: v / total for k, v in weights.items() if v > 0}
-    return shares, used
+    return shares, used, len(PAS_HAPS)
+
 
 # -----------------------------
-# Sedimenttype parsing (k, z, z/s, v, s, s/z, g, x)
+# Sedimenttype parsing
 # -----------------------------
 SED_KEYS = ["k", "z", "z/s", "v", "s", "s/z", "g", "x"]
 SED_LABELS = {
@@ -222,7 +285,8 @@ SED_COLORS = {
     "x": "#1b1b1b",
 }
 
-def _norm_sed_token(t: str) -> str | None:
+
+def _norm_sed_token(t: str):
     if t is None:
         return None
     s = str(t).strip().lower().replace(" ", "")
@@ -235,8 +299,9 @@ def _norm_sed_token(t: str) -> str | None:
     if s in ("k", "z", "v", "s", "g", "x"):
         return s
     if len(s) > 1 and all(ch in ("k", "z", "v", "s", "g", "x") for ch in s):
-        return s  # caller split
+        return s
     return None
+
 
 def _parse_sed_cell(val) -> list[str]:
     if pd.isna(val):
@@ -244,8 +309,7 @@ def _parse_sed_cell(val) -> list[str]:
     s = str(val).strip().lower()
     if s in ("", "nan", "none"):
         return []
-
-    parts = re.split(r"[;,/\\+&]| en | of |\|", s)
+    parts = re.split(r"[;,/\\+&]|\ben\b|\bof\b", s)
     tokens = []
     for p in parts:
         p = p.strip()
@@ -263,10 +327,11 @@ def _parse_sed_cell(val) -> list[str]:
     tokens = list(dict.fromkeys(tokens))
     return [t for t in tokens if t in SED_KEYS]
 
-def _sed_distribution_for_row(row) -> tuple[dict, float]:
+
+def _sed_distribution_for_row(row) -> tuple[dict, float, int]:
     weights = {k: 0.0 for k in SED_KEYS}
     used = 0.0
-    for i in range(1, 6):
+    for i in SED_HAPS:
         col = f"sedimenttype_{i}"
         if col not in row.index:
             continue
@@ -278,19 +343,17 @@ def _sed_distribution_for_row(row) -> tuple[dict, float]:
             if c in weights:
                 weights[c] += w
         used += 1.0
-
     total = sum(weights.values())
     if total <= 0:
-        return {}, used
+        return {}, used, len(SED_HAPS)
     shares = {k: v / total for k, v in weights.items() if v > 0}
-    return shares, used
+    return shares, used, len(SED_HAPS)
+
 
 # -----------------------------
-# Lutumgehalte parsing (percent/klassen)
+# Lutumgehalte parsing
 # -----------------------------
-LUT_KEYS = [
-    "0-2", "2-5", "5-8", "8-12", "12-17", "17-25", "25-35", ">35"
-]
+LUT_KEYS = ["0-2", "2-5", "5-8", "8-12", "12-17", "17-25", "25-35", ">35"]
 LUT_LABELS = {
     "0-2": "0–2% klei-arm zand",
     "2-5": "2–5% kleihoudend zand",
@@ -302,20 +365,19 @@ LUT_LABELS = {
     ">35": ">35% zware klei",
 }
 LUT_COLORS = {
-    "0-2":  "#fff7bc",
-    "2-5":  "#fee391",
-    "5-8":  "#fec44f",
+    "0-2": "#fff7bc",
+    "2-5": "#fee391",
+    "5-8": "#fec44f",
     "8-12": "#fe9929",
-    "12-17":"#ec7014",
-    "17-25":"#cc4c02",
-    "25-35":"#993404",
-    ">35":  "#662506",
+    "12-17": "#ec7014",
+    "17-25": "#cc4c02",
+    "25-35": "#993404",
+    ">35": "#662506",
 }
 
-def _lut_bin_from_number(x: float) -> str | None:
-    if not np.isfinite(x):
-        return None
-    if x < 0:
+
+def _lut_bin_from_number(x: float):
+    if not np.isfinite(x) or x < 0:
         return None
     if x < 2:
         return "0-2"
@@ -333,20 +395,14 @@ def _lut_bin_from_number(x: float) -> str | None:
         return "25-35"
     return ">35"
 
+
 def _parse_lutum_cell(val) -> list[str]:
-    """
-    Parseer één lutum-cel. Ondersteunt:
-    - numeriek: 14, 14%
-    - tekst: '0-2%', '>35%', '8-12', '12-17%' etc.
-    - meerdere waarden in één cel: '8-12 en 12-17' / '8-12;12-17'
-    """
     if pd.isna(val):
         return []
     s = str(val).strip().lower()
     if s in ("", "nan", "none"):
         return []
 
-    # probeer direct numeriek (ook "14%")
     s_num = s.replace("%", "").replace(",", ".")
     try:
         x = float(s_num)
@@ -355,32 +411,24 @@ def _parse_lutum_cell(val) -> list[str]:
     except Exception:
         pass
 
-    # split in delen (meerdere in 1 cel)
-    parts = re.split(r"[;,/\\+&]| en | of |\|", s)
+    parts = re.split(r"[;,/\\+&]|\ben\b|\bof\b", s)
     out = []
     for p in parts:
         p = p.strip().replace(" ", "")
         if not p:
             continue
-
-        # >35 etc.
         if p.startswith(">"):
             nums = re.findall(r"\d+(?:\.\d+)?", p)
             if nums:
                 x = float(nums[0])
                 out.append(_lut_bin_from_number(max(35.0, x)))
             continue
-
-        # bereik 0-2 / 0–2 / 0-2%
         m = re.search(r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)", p)
         if m:
             a = float(m.group(1))
             b = float(m.group(2))
-            mid = (a + b) / 2.0
-            out.append(_lut_bin_from_number(mid))
+            out.append(_lut_bin_from_number((a + b) / 2.0))
             continue
-
-        # losse getal in tekst
         nums = re.findall(r"\d+(?:\.\d+)?", p)
         if nums:
             x = float(nums[0])
@@ -389,14 +437,11 @@ def _parse_lutum_cell(val) -> list[str]:
     out = [x for x in out if x in LUT_KEYS]
     return list(dict.fromkeys(out))
 
-def _lut_distribution_for_row(row) -> tuple[dict, float]:
-    """
-    Verdeling over 5 bodemhappen: lutum_1..lutum_5
-    Bij meerdere klassen in één hap: gelijke verdeling (1/k).
-    """
+
+def _lut_distribution_for_row(row) -> tuple[dict, float, int]:
     weights = {k: 0.0 for k in LUT_KEYS}
     used = 0.0
-    for i in range(1, 6):
+    for i in LUT_HAPS:
         col = f"lutum_{i}"
         if col not in row.index:
             continue
@@ -408,24 +453,55 @@ def _lut_distribution_for_row(row) -> tuple[dict, float]:
             if c in weights:
                 weights[c] += w
         used += 1.0
-
     total = sum(weights.values())
     if total <= 0:
-        return {}, used
+        return {}, used, len(LUT_HAPS)
     shares = {k: v / total for k, v in weights.items() if v > 0}
-    return shares, used
+    return shares, used, len(LUT_HAPS)
+
 
 # -----------------------------
-# Sidebar filters / kaartlaag
+# Prepare data: lat/lon en ids
+# -----------------------------
+if "Locatie" in meas.columns:
+    meas["Locatie_id"] = _loc_id(meas["Locatie"])
+else:
+    meas["Locatie_id"] = ""
+
+# Jaar aanwezig? (bij combine_years in utils)
+if "jaar" not in meas.columns and len(years_sel) == 1:
+    meas["jaar"] = years_sel[0]
+
+# lat/lon fallback: als ontbreekt, probeer RD->WGS84
+if "lat" not in meas.columns or "lon" not in meas.columns:
+    x_col = _find_col(meas, ["x_rd", "X.1", "x.1"])
+    y_col = _find_col(meas, ["y_rd", "Y.1", "y.1"])
+    if x_col and y_col:
+        latlon = meas[[x_col, y_col]].apply(
+            lambda r: rd_to_wgs84(float(r[x_col]), float(r[y_col]))
+            if pd.notna(r[x_col]) and pd.notna(r[y_col])
+            else (np.nan, np.nan),
+            axis=1,
+        )
+        meas["lat"] = [t[0] for t in latlon]
+        meas["lon"] = [t[1] for t in latlon]
+
+# ADV voorbereiden
+if not adv7.empty and "Locatie" in adv7.columns:
+    adv7["Locatie_id"] = _loc_id(adv7["Locatie"])
+
+
+# -----------------------------
+# Sidebar (pagina-specifieke filters)
 # -----------------------------
 with st.sidebar:
     st.header("Filters & lagen")
 
-    sel_deelgebied = st.selectbox(
-        "Deelgebied",
-        options=["(alle)"] + sorted(meas["Deelgebied"].dropna().unique().tolist()),
-        key="deelgebied_sel",
-    )
+    deel_opt = ["(alle)"]
+    if "Deelgebied" in meas.columns:
+        deel_opt += sorted(meas["Deelgebied"].dropna().astype(str).unique().tolist())
+
+    sel_deelgebied = st.selectbox("Deelgebied", options=deel_opt, key="deelgebied_sel")
 
     kaartlaag = st.selectbox(
         "Kaartlaag",
@@ -442,7 +518,6 @@ with st.sidebar:
         key="kaartlaag_sel",
     )
 
-    # Alleen tonen als Biovolumina is geselecteerd
     if kaartlaag == "Biovolumina":
         st.subheader("Biovolumina selectie")
         show_tri = st.checkbox("Driehoeksmossel", value=True, key="bio_tri_chk")
@@ -450,101 +525,76 @@ with st.sidebar:
     else:
         show_tri, show_qua = True, True
 
+
 # -----------------------------
 # Apply filter
 # -----------------------------
 m = meas.copy()
-if sel_deelgebied != "(alle)":
+if sel_deelgebied != "(alle)" and "Deelgebied" in m.columns:
     m = m[m["Deelgebied"] == sel_deelgebied].copy()
 
 if m.empty:
     st.warning("Geen meetpunten gevonden voor de gekozen selectie.")
     st.stop()
 
+
 # -----------------------------
-# ADV (Bijlage 7): merge op Locatie (+ Deelgebied indien beschikbaar)
+# ADV (Bijlage 7): merge op Locatie_id + (Deelgebied) + (jaar)
 # -----------------------------
 ADV_STD_COL = "adv_mg_m2_total"
 
-adv7 = None
-ADV_KEYS = ["adv_m2_locations", "adv_m2_location", "adv_m2", "adv_m2_locations.parquet"]
-for k in ADV_KEYS:
-    tmp = DATA.get(k)
-    if tmp is not None:
-        adv7 = tmp
-        break
-
-# Fallback: direct uit processed lezen (dataprep schrijft dit bestand) [1](https://rijkswaterstaat-my.sharepoint.com/personal/ben_bildirici_rws_nl/Documents/Microsoft%20Copilot%20Chat%20Files/dataprep.py)
-if adv7 is None:
-    p = Path("processed") / "adv_m2_locations.parquet"
-    if p.exists():
-        try:
-            adv7 = pd.read_parquet(p)
-        except Exception:
-            adv7 = None
-
-if adv7 is None or (hasattr(adv7, "empty") and adv7.empty):
+if adv7 is None or adv7.empty:
     m[ADV_STD_COL] = np.nan
 else:
     adv7_df = adv7.copy()
-    adv7_loc_col = _find_col(adv7_df, ["Locatie", "locatie", "LOCATIE"])
-    adv7_deel_col = _find_col(adv7_df, ["Deelgebied", "deelgebied"])
+
     bug_col = _find_col(adv7_df, ["Berekend ADV bugensis (mg/m2)"])
     pol_col = _find_col(adv7_df, ["Berekend ADV polymorpha (mg/m2)"])
-    meas_loc_col = _find_col(m, ["Locatie", "locatie", "LOCATIE"])
-    meas_deel_col = _find_col(m, ["Deelgebied", "deelgebied"])
 
-    if adv7_loc_col is None or meas_loc_col is None or (bug_col is None and pol_col is None):
-        m[ADV_STD_COL] = np.nan
-    else:
-        adv7_df[adv7_loc_col] = pd.to_numeric(adv7_df[adv7_loc_col], errors="coerce")
-        m[meas_loc_col] = pd.to_numeric(m[meas_loc_col], errors="coerce")
+    if bug_col is not None:
+        adv7_df[bug_col] = pd.to_numeric(adv7_df[bug_col], errors="coerce")
+    if pol_col is not None:
+        adv7_df[pol_col] = pd.to_numeric(adv7_df[pol_col], errors="coerce")
 
-        if bug_col is not None:
-            adv7_df[bug_col] = pd.to_numeric(adv7_df[bug_col], errors="coerce")
-        if pol_col is not None:
-            adv7_df[pol_col] = pd.to_numeric(adv7_df[pol_col], errors="coerce")
+    parts = []
+    if bug_col is not None:
+        parts.append(adv7_df[bug_col])
+    if pol_col is not None:
+        parts.append(adv7_df[pol_col])
 
-        parts = []
-        if bug_col is not None:
-            parts.append(adv7_df[bug_col])
-        if pol_col is not None:
-            parts.append(adv7_df[pol_col])
+    adv7_df[ADV_STD_COL] = pd.concat(parts, axis=1).sum(axis=1, min_count=1) if parts else np.nan
 
-        adv7_df[ADV_STD_COL] = pd.concat(parts, axis=1).sum(axis=1, min_count=1)
+    group_cols = ["Locatie_id"]
+    if "Deelgebied" in adv7_df.columns and "Deelgebied" in m.columns:
+        group_cols.append("Deelgebied")
+    if "jaar" in adv7_df.columns and "jaar" in m.columns:
+        group_cols.append("jaar")
 
-        group_cols = [adv7_loc_col]
-        if adv7_deel_col is not None:
-            group_cols.append(adv7_deel_col)
+    adv7_agg = adv7_df.groupby(group_cols, dropna=False)[ADV_STD_COL].mean().reset_index()
 
-        adv7_agg = (
-            adv7_df
-            .groupby(group_cols, dropna=False)[ADV_STD_COL]
-            .mean()
-            .reset_index()
-        )
+    merge_cols = ["Locatie_id"]
+    if "Deelgebied" in adv7_agg.columns and "Deelgebied" in m.columns:
+        merge_cols.append("Deelgebied")
+    if "jaar" in adv7_agg.columns and "jaar" in m.columns:
+        merge_cols.append("jaar")
 
-        if adv7_deel_col is not None and meas_deel_col is not None:
-            m = m.merge(
-                adv7_agg,
-                how="left",
-                left_on=[meas_loc_col, meas_deel_col],
-                right_on=[adv7_loc_col, adv7_deel_col],
-            )
-        else:
-            m = m.merge(
-                adv7_agg,
-                how="left",
-                left_on=[meas_loc_col],
-                right_on=[adv7_loc_col],
-            )
+    m = m.merge(adv7_agg, how="left", on=merge_cols)
+
 
 # -----------------------------
 # Map center
 # -----------------------------
-center = [float(m["lat"].mean()), float(m["lon"].mean())]
+if "lat" not in m.columns or "lon" not in m.columns:
+    st.error("Geen lat/lon informatie beschikbaar om een kaart te tekenen.")
+    st.stop()
+
+center = [
+    float(pd.to_numeric(m["lat"], errors="coerce").mean()),
+    float(pd.to_numeric(m["lon"], errors="coerce").mean()),
+]
 zoom = 10 if sel_deelgebied == "(alle)" else 11
 mp = folium.Map(location=center, zoom_start=zoom, tiles="cartodbpositron")
+
 
 # -----------------------------
 # Layers
@@ -559,11 +609,10 @@ fg_lut = FeatureGroup(name="Lutumgehalte", show=(kaartlaag == "Lutumgehalte"))
 
 POINT_COLOR = "#1f77b4"
 
-# ADV colormap (lichtgroen -> donkergroen), excl. 0 (want 0 => kruis)
+# ADV colormap (lichtgroen -> donkergroen), excl. 0
 adv_vals = pd.to_numeric(m.get(ADV_STD_COL), errors="coerce")
 finite_adv = adv_vals[np.isfinite(adv_vals)]
 finite_adv_pos = finite_adv[finite_adv > 0]
-
 adv_cmap = None
 adv_min = None
 adv_max = None
@@ -572,16 +621,13 @@ if len(finite_adv_pos) > 0:
     adv_max = float(finite_adv_pos.max())
     if adv_max == adv_min:
         adv_max = adv_min + 1.0
-    adv_cmap = cm.LinearColormap(
-        colors=["#e8f5e9", "#1b5e20"],
-        vmin=adv_min,
-        vmax=adv_max,
-    )
+    adv_cmap = cm.LinearColormap(colors=["#e8f5e9", "#1b5e20"], vmin=adv_min, vmax=adv_max)
     adv_cmap.caption = "Asvrij drooggewicht (ADV, mg/m²)"
 
 # Biovolume scaling
 bio_tri_vals = pd.to_numeric(m.get("biovol_driehoek_ml"), errors="coerce")
 bio_qua_vals = pd.to_numeric(m.get("biovol_quagga_ml"), errors="coerce")
+
 bio_vals_pool = []
 if kaartlaag == "Biovolumina":
     if show_tri:
@@ -599,6 +645,7 @@ if bio_vals_pool:
 else:
     bio_min, bio_max = 0.0, 1.0
 
+
 def _bio_radius(v):
     if not np.isfinite(v) or v <= 0:
         return 0
@@ -606,6 +653,7 @@ def _bio_radius(v):
     t = max(0.0, min(1.0, t))
     t = np.sqrt(t)
     return 4 + (20 - 4) * t
+
 
 # -----------------------------
 # Add markers
@@ -617,24 +665,17 @@ for _, row in m.iterrows():
         continue
 
     dg = row.get("Deelgebied", "onbekend")
-    loc = row.get("Locatie", row.get("locatie", ""))
+    loc_txt = row.get("Locatie_id", row.get("Locatie", ""))
 
     biovol_total = _safe_float(row.get("biovol_totaal_ml", 0.0), 0.0)
     b_tri = _safe_float(row.get("biovol_driehoek_ml", 0.0), 0.0)
     b_qua = _safe_float(row.get("biovol_quagga_ml", 0.0), 0.0)
 
-    try:
-        loc_txt = f"{int(loc)}"
-    except Exception:
-        loc_txt = f"{loc}"
-
-    # (1) Meetpunten
     if kaartlaag == "Meetpunten":
         tooltip_point = (
             f"{dg} – Locatie {loc_txt}<br>"
             f"Biovolume totaal: {biovol_total:.2f} ml<br>"
-            f"Driehoek: {b_tri:.2f} ml "
-            f"Quagga: {b_qua:.2f} ml"
+            f"Driehoek: {b_tri:.2f} ml – Quagga: {b_qua:.2f} ml"
         )
         folium.CircleMarker(
             location=[lat, lon],
@@ -646,39 +687,26 @@ for _, row in m.iterrows():
             tooltip=folium.Tooltip(tooltip_point, sticky=True),
         ).add_to(fg_points)
 
-    # (2) Soortverdeling
     if kaartlaag == "Soortverdeling":
         denom = (b_tri + b_qua)
         p_tri = (b_tri / denom) if denom > 0 else 0.0
         p_qua = 1.0 - p_tri
-
         svg = _pie_svg_two(p_tri)
-        icon = folium.DivIcon(
-            html=f"""
-            <div style="width: 28px; height: 28px; transform: translate(-14px, -14px);">
-              {svg}
-            </div>
-            """
-        )
-
+        icon = folium.DivIcon(html=f"""<div style='transform: translate(-50%, -50%);'>{svg}</div>""")
         tooltip_pie = (
             f"{dg} – Locatie {loc_txt}<br>"
             f"Aandeel driehoek: {p_tri:.0%}<br>"
             f"Aandeel quagga: {p_qua:.0%}<br>"
-            f"Driehoek (ml): {b_tri:.2f} "
-            f"Quagga (ml): {b_qua:.2f}"
+            f"Driehoek (ml): {b_tri:.2f} – Quagga (ml): {b_qua:.2f}"
         )
-
         folium.Marker(
             location=[lat, lon],
             icon=icon,
             tooltip=folium.Tooltip(tooltip_pie, sticky=True),
         ).add_to(fg_pies)
 
-    # (3) Asvrijdrooggewicht (Bijlage 7) -> kruis bij NaN of 0
     if kaartlaag == "Asvrijdrooggewicht":
         adv_v = _safe_float(row.get(ADV_STD_COL), np.nan)
-
         if np.isfinite(adv_v) and adv_v > 0 and adv_cmap is not None:
             radius = _scale_radius(adv_v, adv_min, adv_max, rmin=4, rmax=18)
             color = adv_cmap(adv_v)
@@ -706,7 +734,6 @@ for _, row in m.iterrows():
                 tooltip=folium.Tooltip(tooltip_none, sticky=True),
             ).add_to(fg_adv)
 
-    # (4) Biovolumina kaartlaag
     if kaartlaag == "Biovolumina":
         candidates = []
         if show_tri:
@@ -741,10 +768,8 @@ for _, row in m.iterrows():
                     tooltip=folium.Tooltip(tooltip_none, sticky=True),
                 ).add_to(fg_bio)
 
-    # (5) PAS kaartlaag
     if kaartlaag.startswith("PAS"):
-        shares, used_haps = _pas_distribution_for_row(row)
-
+        shares, used_haps, total_haps = _pas_distribution_for_row(row)
         if not shares:
             tooltip_none = f"{dg} – Locatie {loc_txt}<br>PAS: geen (bruikbare) data gevonden"
             folium.Marker(
@@ -754,18 +779,11 @@ for _, row in m.iterrows():
             ).add_to(fg_pas)
         else:
             svg = _pie_svg_multi(shares, PAS_COLORS, r=14)
-            icon = folium.DivIcon(
-                html=f"""
-                <div style="width: 28px; height: 28px; transform: translate(-14px, -14px);">
-                  {svg}
-                </div>
-                """
-            )
+            icon = folium.DivIcon(html=f"""<div style='transform: translate(-50%, -50%);'>{svg}</div>""")
             lines = [f"{PAS_LABELS.get(k, k)}: {frac:.0%}" for k, frac in sorted(shares.items(), key=lambda kv: kv[1], reverse=True)]
             tooltip_pas = (
                 f"{dg} – Locatie {loc_txt}<br>"
-                f"Bodemhappen met PAS-info: {int(used_haps)}/5<br>"
-                + "<br>".join(lines)
+                f"Bodemhappen met PAS-info: {int(used_haps)}/{int(total_haps)}<br>" + "<br>".join(lines)
             )
             folium.Marker(
                 location=[lat, lon],
@@ -773,10 +791,8 @@ for _, row in m.iterrows():
                 tooltip=folium.Tooltip(tooltip_pas, sticky=True),
             ).add_to(fg_pas)
 
-    # (6) Sedimenttype kaartlaag
     if kaartlaag == "Sedimenttype":
-        shares, used_haps = _sed_distribution_for_row(row)
-
+        shares, used_haps, total_haps = _sed_distribution_for_row(row)
         if not shares:
             tooltip_none = f"{dg} – Locatie {loc_txt}<br>Sedimenttype: geen (bruikbare) data gevonden"
             folium.Marker(
@@ -786,18 +802,11 @@ for _, row in m.iterrows():
             ).add_to(fg_sed)
         else:
             svg = _pie_svg_multi(shares, SED_COLORS, r=14)
-            icon = folium.DivIcon(
-                html=f"""
-                <div style="width: 28px; height: 28px; transform: translate(-14px, -14px);">
-                  {svg}
-                </div>
-                """
-            )
+            icon = folium.DivIcon(html=f"""<div style='transform: translate(-50%, -50%);'>{svg}</div>""")
             lines = [f"{SED_LABELS.get(k, k)}: {frac:.0%}" for k, frac in sorted(shares.items(), key=lambda kv: kv[1], reverse=True)]
             tooltip_sed = (
                 f"{dg} – Locatie {loc_txt}<br>"
-                f"Bodemhappen met sedimentinfo: {int(used_haps)}/5<br>"
-                + "<br>".join(lines)
+                f"Bodemhappen met sedimentinfo: {int(used_haps)}/{int(total_haps)}<br>" + "<br>".join(lines)
             )
             folium.Marker(
                 location=[lat, lon],
@@ -805,10 +814,8 @@ for _, row in m.iterrows():
                 tooltip=folium.Tooltip(tooltip_sed, sticky=True),
             ).add_to(fg_sed)
 
-    # (7) Lutumgehalte kaartlaag
     if kaartlaag == "Lutumgehalte":
-        shares, used_haps = _lut_distribution_for_row(row)
-
+        shares, used_haps, total_haps = _lut_distribution_for_row(row)
         if not shares:
             tooltip_none = f"{dg} – Locatie {loc_txt}<br>Lutum: geen (bruikbare) data gevonden"
             folium.Marker(
@@ -818,24 +825,18 @@ for _, row in m.iterrows():
             ).add_to(fg_lut)
         else:
             svg = _pie_svg_multi(shares, LUT_COLORS, r=14)
-            icon = folium.DivIcon(
-                html=f"""
-                <div style="width: 28px; height: 28px; transform: translate(-14px, -14px);">
-                  {svg}
-                </div>
-                """
-            )
+            icon = folium.DivIcon(html=f"""<div style='transform: translate(-50%, -50%);'>{svg}</div>""")
             lines = [f"{LUT_LABELS.get(k, k)}: {frac:.0%}" for k, frac in sorted(shares.items(), key=lambda kv: kv[1], reverse=True)]
             tooltip_lut = (
                 f"{dg} – Locatie {loc_txt}<br>"
-                f"Bodemhappen met lutuminfo: {int(used_haps)}/5<br>"
-                + "<br>".join(lines)
+                f"Bodemhappen met lutuminfo: {int(used_haps)}/{int(total_haps)}<br>" + "<br>".join(lines)
             )
             folium.Marker(
                 location=[lat, lon],
                 icon=icon,
                 tooltip=folium.Tooltip(tooltip_lut, sticky=True),
             ).add_to(fg_lut)
+
 
 # -----------------------------
 # Add selected layer to map
@@ -858,7 +859,9 @@ elif kaartlaag == "Lutumgehalte":
     mp.add_child(fg_lut)
 
 folium.LayerControl(collapsed=False).add_to(mp)
+
 st_folium(mp, height=700, use_container_width=True)
+
 
 # -----------------------------
 # Caption
@@ -868,15 +871,24 @@ if kaartlaag == "Meetpunten":
 elif kaartlaag == "Soortverdeling":
     st.caption("Taartdiagram toont aandeel driehoek én quagga per meetpunt.")
 elif kaartlaag == "Asvrijdrooggewicht":
-    st.caption("Bollen tonen ADV uit Bijlage 7 (mg/m²): groter en donkerder groen = hogere waarde. Kruis = geen ADV-waarde of ADV=0 op die locatie.")
+    st.caption(
+        "Bollen tonen ADV uit Bijlage 7 (mg/m²): groter en donkerder groen = hogere waarde. "
+        "Kruis = geen ADV-waarde of ADV=0 op die locatie."
+    )
 elif kaartlaag == "Biovolumina":
-    if not (show_tri or show_qua):
-        st.caption("Selecteer minimaal één soort (driehoeksmossel en/of quaggamossel) om biovolumina te tonen.")
-    else:
-        st.caption("Biovolumina: bollen per geselecteerde soort (ml). Kruis = 0 of geen waarde. Kleuren: blauw=driehoek, oranje=quagga.")
+    st.caption("Biovolumina: bollen per geselecteerde soort (ml). Kruis = 0 of geen waarde. Kleuren: blauw=driehoek, oranje=quagga.")
 elif kaartlaag.startswith("PAS"):
-    st.caption("PAS: taartdiagram toont verdeling van primair aanhechtingssubstraat over 5 bodemhappen. Bij meerdere substraten in één hap wordt die hap gelijk verdeeld.")
+    st.caption(
+        f"PAS: taartdiagram toont verdeling van primair aanhechtingssubstraat over {len(PAS_HAPS)} bodemhappen. "
+        "Bij meerdere substraten in één hap wordt die hap gelijk verdeeld."
+    )
 elif kaartlaag == "Sedimenttype":
-    st.caption("Sedimenttype: taartdiagram toont verdeling over 5 bodemhappen. Bij meerdere typen in één hap wordt die hap gelijk verdeeld.")
+    st.caption(
+        f"Sedimenttype: taartdiagram toont verdeling over {len(SED_HAPS)} bodemhappen. "
+        "Bij meerdere typen in één hap wordt die hap gelijk verdeeld."
+    )
 else:
-    st.caption("Lutumgehalte: taartdiagram toont verdeling van lutumklassen over 5 bodemhappen. Variatie tussen happen binnen één locatie wordt zichtbaar als meerdere taartsegmenten.")
+    st.caption(
+        f"Lutumgehalte: taartdiagram toont verdeling van lutumklassen over {len(LUT_HAPS)} bodemhappen. "
+        "Variatie tussen happen binnen één locatie wordt zichtbaar als meerdere taartsegmenten."
+    )

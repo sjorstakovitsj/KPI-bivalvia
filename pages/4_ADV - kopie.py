@@ -53,46 +53,6 @@ def _get_table(data: dict[str, pd.DataFrame], base_key: str, years: list[str]) -
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-
-def _multiselect_all_on_context_change(label: str, options: list[str], *, key: str, context: tuple) -> list[str]:
-    """Selecteer standaard alle opties en reset naar alles bij contextwijziging.
-
-    Context omvat hier o.a. de geselecteerde jaren. Daardoor worden alle deelgebieden/soorten
-    automatisch opnieuw geselecteerd zodra de jaarselectie verandert, ook als de opties zelf
-    toevallig gelijk blijven.
-    """
-    state_key = f"__state__{key}"
-    options_tuple = tuple(options)
-    context_state = (options_tuple, tuple(context))
-
-    if state_key not in st.session_state or st.session_state.get(state_key) != context_state:
-        st.session_state[key] = list(options)
-        st.session_state[state_key] = context_state
-    else:
-        current = st.session_state.get(key, [])
-        if not isinstance(current, list):
-            current = list(current) if current is not None else []
-        st.session_state[key] = [v for v in current if v in options]
-
-    return st.multiselect(label, options=options, key=key)
-
-
-def _selectbox_default_on_context_change(label: str, options: list[str], *, key: str, default: str, context: tuple):
-    """Hanteer een vaste default en reset deze bij contextwijziging."""
-    if default not in options:
-        raise ValueError(f"Default '{default}' komt niet voor in opties voor {label}.")
-
-    state_key = f"__state__{key}"
-    context_state = (tuple(options), tuple(context), default)
-
-    if state_key not in st.session_state or st.session_state.get(state_key) != context_state:
-        st.session_state[key] = default
-        st.session_state[state_key] = context_state
-    elif st.session_state.get(key) not in options:
-        st.session_state[key] = default
-
-    return st.selectbox(label, options=options, key=key)
-
 DATA = _load(tuple(years_sel), combine_years)
 adv_len = _get_table(DATA, "adv_lenclass", years_sel)
 
@@ -138,27 +98,11 @@ st.subheader("Filters")
 fcol1, fcol2, fcol3, fcol4 = st.columns(4)
 
 with fcol1:
-    sel_deel = _multiselect_all_on_context_change(
-        "Deelgebied",
-        deel_opts,
-        key="deel_filter",
-        context=tuple(years_sel),
-    )
+    sel_deel = st.multiselect("Deelgebied", options=deel_opts, default=deel_opts, key="deel_filter")
 with fcol2:
-    sel_soort = _multiselect_all_on_context_change(
-        "Soort",
-        soort_opts,
-        key="soort_filter",
-        context=tuple(years_sel),
-    )
+    sel_soort = st.multiselect("Soort", options=soort_opts, default=soort_opts, key="soort_filter")
 with fcol3:
-    view_mode = _selectbox_default_on_context_change(
-        "Visualisatie",
-        ["Lijn (ADV vs SL)", "Boxplot"],
-        key="viz_mode",
-        default="Boxplot",
-        context=tuple(years_sel),
-    )
+    view_mode = st.selectbox("Visualisatie", ["Lijn (ADV vs SL)", "Boxplot"], index=0, key="viz_mode")
 with fcol4:
     min_n = st.number_input(
         "Minimum aantal veraste individuen",

@@ -13,6 +13,7 @@ import pandas as pd
 # ------------------------------------------------------------
 # Verplichte jaargangen (standaard allemaal verwerken)
 REQUIRED_XLSX = [
+    Path("velddata_mosselkartering_midden-nederland_2025.xlsx"),
     Path("velddata_mosselkartering_midden-nederland_2024.xlsx"),
     Path("velddata_mosselkartering_midden-nederland_2023.xlsx"),
     Path("velddata_mosselkartering_midden-nederland_2021.xlsx"),

@@ -18,7 +18,6 @@ st.set_page_config(page_title="Meetpunt detail", layout="wide")
 ui = render_sidebar(title="Mosselkartering")
 years_sel = list(ui.get("years", []))
 combine_years = bool(ui.get("combine_years", False))
-keep_only_canonical = bool(ui.get("keep_only_canonical", False))
 
 st.title("🔍 Deep-dive per meetlocatie")
 
@@ -31,11 +30,10 @@ if not years_sel:
 # Data helpers
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def _load(years: tuple[str, ...], combine: bool, keep_only: bool) -> dict[str, pd.DataFrame]:
+def _load(years: tuple[str, ...], combine: bool) -> dict[str, pd.DataFrame]:
     return load_data(
         years=list(years),
         combine_years=combine,
-        keep_only_canonical=keep_only,
     )
 
 
@@ -116,7 +114,7 @@ def _safe_numeric(series: pd.Series) -> pd.Series:
 # -----------------------------
 # Data ophalen
 # -----------------------------
-DATA = _load(tuple(years_sel), combine_years, keep_only_canonical)
+DATA = _load(tuple(years_sel), combine_years)
 meas = _get_table(DATA, "measurements", years_sel)
 
 if meas is None or meas.empty:
@@ -205,7 +203,7 @@ with col1:
                 tooltip=f"Locatie {str(r['Locatie'])} – {pd.to_datetime(r['Datum']).date()}{jaar_txt}",
             ).add_to(mp)
 
-        st_folium(mp, height=360, use_container_width=True)
+        st_folium(mp, height=360, width="stretch")
     else:
         st.info("Geen kaartcoördinaten (lat/lon) beschikbaar voor deze locatie.")
 
@@ -282,7 +280,7 @@ else:
             labels={"value": "ml", "variable": "Reeks"},
         )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 # -----------------------------
 # Hapdetails
@@ -295,7 +293,7 @@ hap_cols = [
 
 if hap_cols:
     detail_cols = [c for c in ["jaar", "Datum"] if c in m.columns] + hap_cols
-    st.dataframe(m[detail_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
+    st.dataframe(m[detail_cols].reset_index(drop=True), width="stretch", hide_index=True)
 else:
     st.info("Geen hapdetails gevonden in de dataset.")
 
@@ -303,7 +301,7 @@ else:
 # Volledige records + download
 # -----------------------------
 with st.expander("Toon volledige record(s)"):
-    st.dataframe(m.reset_index(drop=True), use_container_width=True, hide_index=True)
+    st.dataframe(m.reset_index(drop=True), width="stretch", hide_index=True)
 
 csv = m.to_csv(index=False).encode("utf-8")
 st.download_button(

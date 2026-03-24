@@ -13,7 +13,6 @@ st.set_page_config(page_title="Mosselkartering dashboard", layout="wide")
 ui = render_sidebar(title="Mosselkartering")
 years_sel = list(ui.get("years", []))
 combine_years = bool(ui.get("combine_years", False))
-keep_only_canonical = bool(ui.get("keep_only_canonical", False))
 
 st.title("📊 Mosselkartering – overzicht")
 
@@ -23,8 +22,8 @@ if not years_sel:
 
 
 @st.cache_data(show_spinner=False)
-def _load(years: tuple[str, ...], combine: bool, keep_only: bool):
-    return load_data(years=list(years), combine_years=combine, keep_only_canonical=keep_only)
+def _load(years: tuple[str, ...], combine: bool):
+    return load_data(years=list(years), combine_years=combine)
 
 
 def _get_measurements(data: dict, years: list[str]) -> pd.DataFrame:
@@ -104,7 +103,7 @@ def _ensure_measurement_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-DATA = _load(tuple(years_sel), combine_years, keep_only_canonical)
+DATA = _load(tuple(years_sel), combine_years)
 meas_raw = _get_measurements(DATA, years_sel)
 
 if meas_raw.empty:
@@ -232,7 +231,7 @@ if sort_cols:
         ascending[sort_cols.index("gem_biovol_ml")] = False
     show = show.sort_values(sort_cols, ascending=ascending)
 
-st.dataframe(show, use_container_width=True)
+st.dataframe(show, width="stretch")
 
 st.caption(
     "Alle KPI’s en de tabel zijn berekend op basis van unieke locaties: per locatie worden (eventuele) meerdere meetmomenten eerst gemiddeld. "

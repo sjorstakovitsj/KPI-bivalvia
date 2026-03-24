@@ -2,4 +2,5 @@ algemeen:
 - andere datasets toevoegen
 
 pagina's:
-- 
+- P4; default alle deelgebied en soorten geselecteerd. Visualisatie default = boxplot
+- inlezen ADV 2025 niet goed gelukt

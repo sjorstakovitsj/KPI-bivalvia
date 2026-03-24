@@ -15,7 +15,6 @@ st.set_page_config(page_title="Populatieopbouw", layout="wide")
 ui = render_sidebar(title="Mosselkartering")
 years_sel = list(ui.get("years", []))
 combine_years = bool(ui.get("combine_years", False))
-keep_only_canonical = bool(ui.get("keep_only_canonical", False))
 
 st.title("👥 Populatieopbouw per deelgebied per soort")
 
@@ -25,11 +24,11 @@ if not years_sel:
 
 
 @st.cache_data(show_spinner=False)
-def _load(years: tuple[str, ...], combine: bool, keep_only: bool) -> dict[str, pd.DataFrame]:
-    return load_data(years=list(years), combine_years=combine, keep_only_canonical=keep_only)
+def _load(years: tuple[str, ...], combine: bool) -> dict[str, pd.DataFrame]:
+    return load_data(years=list(years), combine_years=combine)
 
 
-DATA = _load(tuple(years_sel), combine_years, keep_only_canonical)
+DATA = _load(tuple(years_sel), combine_years)
 
 # ------------------------------------------------------------
 # Helpers
@@ -77,6 +76,29 @@ def _get_table(data: dict[str, pd.DataFrame], base_key: str, years: list[str]) -
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+
+def _multiselect_all_on_context_change(label: str, options: list[str], *, key: str, context: tuple) -> list[str]:
+    """Selecteer standaard alle opties en reset naar alles bij contextwijziging.
+
+    Context omvat hier o.a. de geselecteerde jaren. Daardoor worden alle deelgebieden/soorten
+    automatisch opnieuw geselecteerd zodra de jaarselectie verandert, ook als de opties zelf
+    toevallig gelijk blijven.
+    """
+    state_key = f"__state__{key}"
+    options_tuple = tuple(options)
+    context_state = (options_tuple, tuple(context))
+
+    if state_key not in st.session_state or st.session_state.get(state_key) != context_state:
+        st.session_state[key] = list(options)
+        st.session_state[state_key] = context_state
+    else:
+        current = st.session_state.get(key, [])
+        if not isinstance(current, list):
+            current = list(current) if current is not None else []
+        st.session_state[key] = [v for v in current if v in options]
+
+    return st.multiselect(label, options=options, key=key)
+
 # ------------------------------------------------------------
 # Data
 # ------------------------------------------------------------
@@ -107,9 +129,19 @@ with tab1:
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        sel_deel = st.multiselect("Deelgebieden", deel_opts, default=deel_opts)
+        sel_deel = _multiselect_all_on_context_change(
+            "Deelgebieden",
+            deel_opts,
+            key="deel_counts",
+            context=tuple(years_sel),
+        )
     with col2:
-        sel_soort = st.multiselect("Soorten", soort_opts, default=soort_opts)
+        sel_soort = _multiselect_all_on_context_change(
+            "Soorten",
+            soort_opts,
+            key="soort_counts",
+            context=tuple(years_sel),
+        )
     with col3:
         mode = st.selectbox("Weergave", ["Gestapeld", "Groepen"], index=0)
 
@@ -142,14 +174,14 @@ with tab1:
             labels={"Lengteklasse": "Lengteklasse (mm)", "Aantal": "Aantal", "Soort": "Soort"},
         )
         fig.update_layout(height=700)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.subheader("Totaal per deelgebied en soort")
         group_cols = ["Deelgebied", "Soort"]
         if "Jaar" in view.columns and view["Jaar"].nunique() > 1:
             group_cols = ["Jaar"] + group_cols
         tot = view.groupby(group_cols, as_index=False)["Aantal"].sum()
-        st.dataframe(tot, use_container_width=True)
+        st.dataframe(tot, width="stretch")
 
 with tab2:
     _validate(perc_raw, "populatie_percent")
@@ -175,9 +207,19 @@ with tab2:
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        sel_deel = st.multiselect("Deelgebieden", deel_opts, default=deel_opts, key="deel_perc")
+        sel_deel = _multiselect_all_on_context_change(
+            "Deelgebieden",
+            deel_opts,
+            key="deel_perc",
+            context=tuple(years_sel),
+        )
     with col2:
-        sel_soort = st.multiselect("Soorten", soort_opts, default=soort_opts, key="soort_perc")
+        sel_soort = _multiselect_all_on_context_change(
+            "Soorten",
+            soort_opts,
+            key="soort_perc",
+            context=tuple(years_sel),
+        )
     with col3:
         as_line = st.checkbox("Toon als lijnen", value=False)
 
@@ -216,11 +258,11 @@ with tab2:
             )
 
         fig.update_layout(height=700)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.subheader("Controle: som per deelgebied en soort (≈100%)")
         group_cols = ["Deelgebied", "Soort"]
         if "Jaar" in view.columns and view["Jaar"].nunique() > 1:
             group_cols = ["Jaar"] + group_cols
         chk = view.groupby(group_cols, as_index=False)["Percentage"].sum()
-        st.dataframe(chk, use_container_width=True)
+        st.dataframe(chk, width="stretch")

@@ -16,7 +16,6 @@ st.set_page_config(page_title="Datakwaliteit & metadata", layout="wide")
 ui = render_sidebar(title="Mosselkartering")
 years_sel = list(ui.get("years", []))
 combine_years = bool(ui.get("combine_years", False))
-keep_only_canonical = bool(ui.get("keep_only_canonical", False))
 
 st.title("✅ Datakwaliteit en metadata")
 
@@ -29,11 +28,10 @@ if not years_sel:
 # Data helpers
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def _load(years: tuple[str, ...], combine: bool, keep_only: bool) -> dict[str, pd.DataFrame]:
+def _load(years: tuple[str, ...], combine: bool) -> dict[str, pd.DataFrame]:
     return load_data(
         years=list(years),
         combine_years=combine,
-        keep_only_canonical=keep_only,
     )
 
 
@@ -121,7 +119,7 @@ def _unique_nonempty_values(frame: pd.DataFrame, columns: list[str]) -> list[str
 # -----------------------------
 # Data ophalen
 # -----------------------------
-DATA = _load(tuple(years_sel), combine_years, keep_only_canonical)
+DATA = _load(tuple(years_sel), combine_years)
 meas = _get_table(DATA, "measurements", years_sel)
 
 if meas is None or meas.empty:
@@ -206,7 +204,7 @@ if counts_year.empty:
     st.info("Geen geldige datums/jaren beschikbaar in de huidige selectie.")
 else:
     fig = px.bar(counts_year, x="jaar_num", y="n", labels={"jaar_num": "Jaar", "n": "Aantal"})
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 # per deelgebied
 st.subheader("Aantal waarnemingen per jaar per deelgebied")
@@ -228,7 +226,7 @@ else:
         barmode="stack",
         labels={"jaar_num": "Jaar", "n": "Aantal"},
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
 # -----------------------
 # Meetgaten
@@ -243,7 +241,7 @@ else:
         .pivot_table(index="Locatie", columns="jaar_num", values="waarde", aggfunc="max", fill_value=0)
         .sort_index()
     )
-    st.dataframe(pivot, use_container_width=True)
+    st.dataframe(pivot, width="stretch")
 
     heat_df = pivot.reset_index().melt(id_vars="Locatie", var_name="jaar", value_name="gemeten")
     fig_gap = px.density_heatmap(
@@ -255,7 +253,7 @@ else:
         color_continuous_scale="Viridis",
         title="Meetgaten-heatmap (1 = gemeten, 0 = geen waarneming)",
     )
-    st.plotly_chart(fig_gap, use_container_width=True)
+    st.plotly_chart(fig_gap, width="stretch")
 
 # -----------------------
 # Consistentie codes (sediment / PAS / lutum)
@@ -316,12 +314,12 @@ if rd_required.issubset(set(view.columns)):
         st.info("Geen geldige RD-coördinaten beschikbaar om afwijkingen te berekenen.")
     else:
         figd = px.histogram(valid_d, x="delta_m", nbins=30, title="Verdeling afwijking (m)")
-        st.plotly_chart(figd, use_container_width=True)
+        st.plotly_chart(figd, width="stretch")
 
         st.write("Top 10 grootste afwijkingen:")
         top_cols = [c for c in ["jaar", "Deelgebied", "Locatie", "Datum", "delta_m", "Opmerkingen"] if c in valid_d.columns]
         top = valid_d.sort_values("delta_m", ascending=False).head(10)[top_cols]
-        st.dataframe(top, use_container_width=True, hide_index=True)
+        st.dataframe(top, width="stretch", hide_index=True)
 else:
     st.info("Planned/uitgevoerd RD-coördinaten zijn niet compleet in de dataset.")
 
@@ -340,10 +338,10 @@ figm = px.bar(
     orientation="h",
     title=f"Top missende kolommen (max {show_missing_top_n})",
 )
-st.plotly_chart(figm, use_container_width=True)
+st.plotly_chart(figm, width="stretch")
 
 with st.expander("Volledige missing-tabel"):
-    st.dataframe(miss, use_container_width=True, hide_index=True)
+    st.dataframe(miss, width="stretch", hide_index=True)
 
 csv = miss.to_csv(index=False).encode("utf-8")
 st.download_button(

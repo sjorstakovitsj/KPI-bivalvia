@@ -69,24 +69,6 @@ def rd_to_wgs84(x: float, y: float) -> tuple[float, float]:
 # Deelgebied normalisatie
 # ------------------------------------------------------------
 # Uitgebreid met extra meren/wateren die in andere monitoringsjaren voorkomen.
-CANONICAL_DEELGEBIEDEN = {
-    "Hoornse Hop",
-    "IJmeer",
-    "Markermeer Noord",
-    "Markermeer Midden",
-    "Markermeer Zuid",
-    "Zwartemeer",
-    "Ketelmeer",
-    "Vossemeer",
-    "Drontermeer",
-    "Veluwemeer",
-    "Wolderwijd",
-    "Nuldernauw",
-    "Eemmeer",
-    "Gooimeer",
-    "Nijkerkernauw",
-    "Reevediep",
-}
 
 
 def normalize_deelgebied(val):
@@ -136,20 +118,12 @@ def normalize_deelgebied(val):
     return s
 
 
-def normalize_deelgebied_col(df: pd.DataFrame, keep_only_canonical: bool = False) -> pd.DataFrame:
-    """Normaliseer Deelgebied-kolom in een DataFrame.
-
-    - keep_only_canonical=False (default): behoud alle deelgebieden (multi-year).
-    - keep_only_canonical=True: behoud alleen CANONICAL_DEELGEBIEDEN (oude gedrag).
-
-    Functionaliteit blijft behouden doordat je het oude gedrag nog expliciet kunt kiezen.
-    """
+def normalize_deelgebied_col(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliseer Deelgebied-kolom in een DataFrame."""
     if df is None or df.empty or "Deelgebied" not in df.columns:
         return df
     out = df.copy()
     out["Deelgebied"] = out["Deelgebied"].apply(normalize_deelgebied)
-    if keep_only_canonical:
-        out = out[out["Deelgebied"].isin(CANONICAL_DEELGEBIEDEN)].copy()
     return out
 
 
@@ -252,7 +226,6 @@ def load_data(
     year: str | None = None,
     years: list[str] | None = None,
     combine_years: bool = False,
-    keep_only_canonical: bool | None = None,
     data_dir: Path | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Laad de benodigde tabellen.
@@ -262,19 +235,11 @@ def load_data(
     - years=['2021','2023','2024'] laadt meerdere jaren.
     - combine_years=True plakt jaren onder elkaar en voegt kolom 'jaar' toe.
 
-    keep_only_canonical:
-    - None: lees uit env KEEP_ONLY_CANONICAL (default '0')
-    - True/False: forceer gedrag
-
     Backwards compatible:
     - load_data() werkt nog steeds en laadt root (DATA_DIR) zoals voorheen.
     """
 
     root = data_dir or DATA_DIR
-
-    # default canonical gedrag via env (oude app had canonical filtering aan).
-    if keep_only_canonical is None:
-        keep_only_canonical = os.getenv("KEEP_ONLY_CANONICAL", "0") == "1"
 
     # Bepaal welke jaren
     if years is None:
@@ -299,7 +264,7 @@ def load_data(
                     continue
                 try:
                     df = load_table(tname, year=y, data_dir=root)
-                    df = normalize_deelgebied_col(df, keep_only_canonical=bool(keep_only_canonical))
+                    df = normalize_deelgebied_col(df)
                     df["jaar"] = str(y)
                     frames.append(df)
                 except Exception:
@@ -316,7 +281,7 @@ def load_data(
             for key, tname in tables.items():
                 try:
                     df = load_table(tname, year=y, data_dir=root)
-                    df = normalize_deelgebied_col(df, keep_only_canonical=bool(keep_only_canonical))
+                    df = normalize_deelgebied_col(df)
                     data[f"{key}_{y}"] = df
                 except Exception:
                     data[f"{key}_{y}"] = pd.DataFrame()
@@ -327,7 +292,7 @@ def load_data(
     for key, tname in tables.items():
         try:
             df = load_table(tname, year=y0 if y0 is not None else None, data_dir=root)
-            df = normalize_deelgebied_col(df, keep_only_canonical=bool(keep_only_canonical))
+            df = normalize_deelgebied_col(df)
             data[key] = df
         except Exception:
             data[key] = pd.DataFrame()
@@ -396,7 +361,6 @@ def render_sidebar(
     Retourneert o.a.:
     - years: list[str]
     - combine_years: bool
-    - keep_only_canonical: bool
 
     Let op: Streamlit is optioneel. Als streamlit niet beschikbaar is, geeft deze functie defaults terug.
     """
@@ -408,7 +372,6 @@ def render_sidebar(
         return {
             "years": yrs,
             "combine_years": False,
-            "keep_only_canonical": False,
         }
 
     st.sidebar.title(title)
@@ -437,21 +400,11 @@ def render_sidebar(
         )
         years_sel = [y] if y else []
 
+    # UI-optie voor het combineren van jaren is verwijderd.
+    # Behoud de key voor compatibiliteit met bestaande pagina's.
     combine_years = False
-    if allow_combine and allow_multi_year:
-        combine_years = st.sidebar.checkbox(
-            "Combineer geselecteerde jaren (voeg kolom 'jaar' toe)",
-            value=False,
-        )
-
-    keep_only_canonical = st.sidebar.checkbox(
-        "Filter deelgebieden op vaste set (legacy)",
-        value=(os.getenv("KEEP_ONLY_CANONICAL", "0") == "1"),
-        help="Zet aan om alleen bekende deelgebieden te tonen (oude dashboard-gedrag).",
-    )
 
     return {
         "years": years_sel,
         "combine_years": combine_years,
-        "keep_only_canonical": keep_only_canonical,
     }

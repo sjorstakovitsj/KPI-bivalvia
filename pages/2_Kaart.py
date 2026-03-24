@@ -2,6 +2,7 @@
 # Kaartpagina (Folium) – mosselkartering
 
 import re
+import urllib.parse
 
 import branca.colormap as cm
 import folium
@@ -16,13 +17,31 @@ from utils import load_data, render_sidebar, rd_to_wgs84
 
 st.set_page_config(page_title="Kaart – Mosselkartering", layout="wide")
 
+WMS_BASE_URL = "https://geo.rijkswaterstaat.nl/services/ogc/gdr/bodemhoogte_ijsselmeergebied/ows"
+WMS_LAYER_NAME = "bodemhoogte_ijg_2022"
+WMS_ATTRIBUTION = "Rijkswaterstaat bathymetrie IJsselmeergebied"
+TRIANGLE_COLOR = "#1f77b4"
+QUAGGA_COLOR = "#ff7f0e"
+
+
+def build_wms_legend_url() -> str:
+    params = {
+        "SERVICE": "WMS",
+        "REQUEST": "GetLegendGraphic",
+        "VERSION": "1.0.0",
+        "FORMAT": "image/png",
+        "LAYER": WMS_LAYER_NAME,
+        "STYLE": "",
+    }
+    return f"{WMS_BASE_URL}?{urllib.parse.urlencode(params)}"
+
+
 # -----------------------------
 # Gedeelde sidebar (zelfde op alle pagina's)
 # -----------------------------
-ui = render_sidebar(title="Mosselkartering")
+ui = render_sidebar(title="Mosselkartering", allow_multi_year=False, allow_combine=False)
 years_sel = list(ui.get("years", []))
 combine_years = bool(ui.get("combine_years", False))
-keep_only_canonical = bool(ui.get("keep_only_canonical", False))
 
 st.title("🗺️ Kaart en ruimtelijke analyse")
 
@@ -32,11 +51,11 @@ if not years_sel:
 
 
 @st.cache_data(show_spinner=False)
-def _load(years: tuple[str, ...], combine: bool, keep_only: bool):
-    return load_data(years=list(years), combine_years=combine, keep_only_canonical=keep_only)
+def _load(years: tuple[str, ...], combine: bool):
+    return load_data(years=list(years), combine_years=combine)
 
 
-DATA = _load(tuple(years_sel), combine_years, keep_only_canonical)
+DATA = _load(tuple(years_sel), combine_years)
 
 meas = DATA.get("measurements", pd.DataFrame()).copy()
 adv7 = DATA.get("adv_m2", pd.DataFrame()).copy()
@@ -132,8 +151,8 @@ LUT_HAPS = LUT_HAPS or list(range(1, 6))
 def _pie_svg_two(
     p_a: float,
     r: int = 14,
-    color_a: str = "#1f77b4",
-    color_b: str = "#ff7f0e",
+    color_a: str = TRIANGLE_COLOR,
+    color_b: str = QUAGGA_COLOR,
     stroke: str = "#333333",
 ) -> str:
     """2-delige taart (inline SVG). p_a = aandeel A (0..1), rest B."""
@@ -188,6 +207,53 @@ def _pie_svg_multi(shares: dict, colors: dict, r: int = 14, stroke: str = "#3333
 
     svg_parts.append("</svg>")
     return "\n".join(svg_parts).strip()
+
+def _legend_html(items: list[tuple[str, str]], *, opacity: float = 1.0) -> str:
+    """Bouw een eenvoudige HTML-legenda met vaste kleurschakering."""
+    blocks = []
+    for label, color in items:
+        blocks.append(
+            f"<div style='display:flex;align-items:center;gap:0.55rem;margin:0.2rem 0;'>"
+            f"<span style='display:inline-block;width:14px;height:14px;min-width:14px;"
+            f"border:1px solid #333;border-radius:50%;background:{color};opacity:{opacity};'></span>"
+            f"<span>{label}</span></div>"
+        )
+    return "<div style='padding:0.15rem 0 0.1rem 0;'>" + "".join(blocks) + "</div>"
+
+
+def _render_layer_legend(kaartlaag: str, show_tri: bool, show_qua: bool) -> None:
+    legend_items: list[tuple[str, str]] = []
+    legend_note = None
+    legend_opacity = 1.0
+
+    if kaartlaag == "Soortverdeling":
+        legend_items = [
+            ("Driehoeksmossel", TRIANGLE_COLOR),
+            ("Quaggamossel", QUAGGA_COLOR),
+        ]
+        legend_note = "Soortverdeling gebruikt altijd blauw voor driehoeksmossel en oranje voor quaggamossel."
+    elif kaartlaag == "Biovolumina":
+        if show_tri:
+            legend_items.append(("Driehoeksmossel", TRIANGLE_COLOR))
+        if show_qua:
+            legend_items.append(("Quaggamossel", QUAGGA_COLOR))
+        legend_opacity = 0.45
+        legend_note = "De semitransparante opvulling van de bollen blijft behouden; de bolgrootte geeft het biovolume weer."
+    elif kaartlaag.startswith("PAS"):
+        legend_items = [(PAS_LABELS[k], PAS_COLORS[k]) for k in PAS_KEYS]
+        legend_note = "Vaste kleurschakering voor primair aanhechtingssubstraat (PAS)."
+    elif kaartlaag == "Sedimenttype":
+        legend_items = [(SED_LABELS[k], SED_COLORS[k]) for k in SED_KEYS]
+        legend_note = "Vaste kleurschakering voor sedimenttypen."
+    elif kaartlaag == "Lutumgehalte":
+        legend_items = [(LUT_LABELS[k], LUT_COLORS[k]) for k in LUT_KEYS]
+        legend_note = "Vaste kleurschakering voor lutumklassen."
+
+    if legend_items:
+        st.markdown(f"**Legenda kaartlaag: {kaartlaag}**")
+        st.markdown(_legend_html(legend_items, opacity=legend_opacity), unsafe_allow_html=True)
+        if legend_note:
+            st.caption(legend_note)
 
 
 # -----------------------------
@@ -593,7 +659,18 @@ center = [
     float(pd.to_numeric(m["lon"], errors="coerce").mean()),
 ]
 zoom = 10 if sel_deelgebied == "(alle)" else 11
-mp = folium.Map(location=center, zoom_start=zoom, tiles="cartodbpositron")
+mp = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True)
+folium.raster_layers.WmsTileLayer(
+    url=WMS_BASE_URL,
+    name="Bathymetrie IJsselmeergebied",
+    layers=WMS_LAYER_NAME,
+    fmt="image/png",
+    transparent=True,
+    version="1.3.0",
+    attr=WMS_ATTRIBUTION,
+    overlay=False,
+    control=False,
+).add_to(mp)
 
 
 # -----------------------------
@@ -607,7 +684,7 @@ fg_pas = FeatureGroup(name="PAS (primair aanhechtingssubstraat)", show=(kaartlaa
 fg_sed = FeatureGroup(name="Sedimenttype", show=(kaartlaag == "Sedimenttype"))
 fg_lut = FeatureGroup(name="Lutumgehalte", show=(kaartlaag == "Lutumgehalte"))
 
-POINT_COLOR = "#1f77b4"
+POINT_COLOR = TRIANGLE_COLOR
 
 # ADV colormap (lichtgroen -> donkergroen), excl. 0
 adv_vals = pd.to_numeric(m.get(ADV_STD_COL), errors="coerce")
@@ -737,9 +814,9 @@ for _, row in m.iterrows():
     if kaartlaag == "Biovolumina":
         candidates = []
         if show_tri:
-            candidates.append(("Driehoeksmossel", b_tri, "#1f77b4"))
+            candidates.append(("Driehoeksmossel", b_tri, TRIANGLE_COLOR))
         if show_qua:
-            candidates.append(("Quaggamossel", b_qua, "#ff7f0e"))
+            candidates.append(("Quaggamossel", b_qua, QUAGGA_COLOR))
         candidates.sort(key=lambda t: (t[1] if np.isfinite(t[1]) else -1), reverse=True)
 
         for label, val, col in candidates:
@@ -860,7 +937,18 @@ elif kaartlaag == "Lutumgehalte":
 
 folium.LayerControl(collapsed=False).add_to(mp)
 
-st_folium(mp, height=700, use_container_width=True)
+st_folium(mp, height=700, width="stretch")
+
+_render_layer_legend(kaartlaag, show_tri, show_qua)
+
+
+legend_url = build_wms_legend_url()
+with st.expander("Legenda bathymetrie", expanded=False):
+    st.markdown(
+        f'<img src="{legend_url}" alt="Legenda bathymetrie" style="max-width:360px; width:100%; height:auto;"/>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Legenda uit de WMS-kaartservice van Rijkswaterstaat.")
 
 
 # -----------------------------
@@ -869,7 +957,7 @@ st_folium(mp, height=700, use_container_width=True)
 if kaartlaag == "Meetpunten":
     st.caption("Meetpunten hebben één uniforme kleur. Tooltip toont biovolume-informatie.")
 elif kaartlaag == "Soortverdeling":
-    st.caption("Taartdiagram toont aandeel driehoek én quagga per meetpunt.")
+    st.caption("Taartdiagram toont aandeel driehoek én quagga per meetpunt. Kleuren zijn vast: blauw = driehoeksmossel, oranje = quaggamossel.")
 elif kaartlaag == "Asvrijdrooggewicht":
     st.caption(
         "Bollen tonen ADV uit Bijlage 7 (mg/m²): groter en donkerder groen = hogere waarde. "

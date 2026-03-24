@@ -20,7 +20,6 @@ st.set_page_config(page_title="Relaties & PCA", layout="wide")
 ui = render_sidebar(title="Mosselkartering")
 years_sel = list(ui.get("years", []))
 combine_years = bool(ui.get("combine_years", False))
-keep_only_canonical = bool(ui.get("keep_only_canonical", False))
 
 st.title("🔗 Relaties en verklaringen")
 
@@ -43,11 +42,10 @@ except Exception:
 # Data helpers
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def _load(years: tuple[str, ...], combine: bool, keep_only: bool) -> dict[str, pd.DataFrame]:
+def _load(years: tuple[str, ...], combine: bool) -> dict[str, pd.DataFrame]:
     return load_data(
         years=list(years),
         combine_years=combine,
-        keep_only_canonical=keep_only,
     )
 
 
@@ -148,7 +146,7 @@ def add_numpy_trendline(fig, df, xcol, ycol, color="#111111", name="Lineaire fit
 # ---------------------------------------------------------
 # Data
 # ---------------------------------------------------------
-DATA = _load(tuple(years_sel), combine_years, keep_only_canonical)
+DATA = _load(tuple(years_sel), combine_years)
 meas = _get_table(DATA, "measurements", years_sel)
 
 if meas is None or meas.empty:
@@ -294,7 +292,7 @@ with col1:
             color="#111111",
             name="Lineaire fit (numpy)",
         )
-    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(fig1, width="stretch")
 
 with col2:
     df2 = view.dropna(subset=["lutum_%", yvar]).copy()
@@ -319,7 +317,7 @@ with col2:
             color="#111111",
             name="Lineaire fit (numpy)",
         )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
 # ---------------------------------------------------------
 # 2) PCA + clustering
@@ -384,7 +382,7 @@ figp = px.scatter(
     hover_data=hover_pca,
     title="PCA 2D – meetpunten met vergelijkbare toestand",
 )
-st.plotly_chart(figp, use_container_width=True)
+st.plotly_chart(figp, width="stretch")
 
 st.caption(
     f"Verklaarde variantie: PC1={pca.explained_variance_ratio_[0]:.2f}, "
@@ -398,7 +396,7 @@ clu = (
     .size()
     .rename(columns={"size": "n"})
 )
-st.dataframe(clu, use_container_width=True, hide_index=True)
+st.dataframe(clu, width="stretch", hide_index=True)
 
 csv = clu.to_csv(index=False).encode("utf-8")
 st.download_button(

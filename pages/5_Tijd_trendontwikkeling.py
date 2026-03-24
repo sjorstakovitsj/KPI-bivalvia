@@ -16,7 +16,6 @@ st.set_page_config(page_title="Tijd & trend", layout="wide")
 ui = render_sidebar(title="Mosselkartering")
 years_sel = list(ui.get("years", []))
 combine_years = bool(ui.get("combine_years", False))
-keep_only_canonical = bool(ui.get("keep_only_canonical", False))
 
 st.title("📈 Tijd en trendanalyse")
 
@@ -72,11 +71,10 @@ def trend_label(slope, tol=0.0):
 # Data laden (zelfde patroon als 4_ADV.py)
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def _load(years: tuple[str, ...], combine: bool, keep_only: bool) -> dict[str, pd.DataFrame]:
+def _load(years: tuple[str, ...], combine: bool) -> dict[str, pd.DataFrame]:
     return load_data(
         years=list(years),
         combine_years=combine,
-        keep_only_canonical=keep_only,
     )
 
 
@@ -174,7 +172,7 @@ def _prepare_measurements(meas: pd.DataFrame, metric: str) -> pd.DataFrame:
 # -----------------------------
 # Data ophalen
 # -----------------------------
-DATA = _load(tuple(years_sel), combine_years, keep_only_canonical)
+DATA = _load(tuple(years_sel), combine_years)
 meas = _get_table(DATA, "measurements", years_sel)
 
 if meas is None or meas.empty:
@@ -312,7 +310,7 @@ fig.update_layout(
     margin=dict(l=10, r=10, t=60, b=10),
 )
 
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 # -----------------------------
 # Slope analyse per locatie
@@ -358,7 +356,7 @@ else:
     tc3.metric("Stabiel", int(trend_counts.get("stabiel", 0)))
     tc4.metric("Onbekend", int(trend_counts.get("onbekend", 0)))
 
-    st.dataframe(trend_df, use_container_width=True, hide_index=True)
+    st.dataframe(trend_df, width="stretch", hide_index=True)
 
 # -----------------------------
 # Voor/na vergelijking
@@ -433,8 +431,8 @@ else:
             margin=dict(l=10, r=10, t=60, b=10),
         )
 
-        st.plotly_chart(figc, use_container_width=True)
-        st.dataframe(comp, use_container_width=True, hide_index=True)
+        st.plotly_chart(figc, width="stretch")
+        st.dataframe(comp, width="stretch", hide_index=True)
 
         csv = comp.to_csv(index=False).encode("utf-8")
         st.download_button(
